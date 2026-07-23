@@ -34,6 +34,14 @@ export const commentRequestSchema = z.object({
 export const commentDeleteSchema = z.object({
   file: z.string(),
   line: z.number(),
+  threadId: z.string().uuid().optional(),
+})
+
+export const commentFollowUpSchema = z.object({
+  file: z.string(),
+  line: z.number(),
+  text: z.string(),
+  threadId: z.string().uuid().optional(),
 })
 
 export const AGENT_BACKENDS = ['pi', 'claude', 'codex'] as const
@@ -65,6 +73,7 @@ export const fileContentsQuerySchema = z.object({
 export type ViewedRequest = z.infer<typeof viewedRequestSchema>
 export type CommentRequest = z.infer<typeof commentRequestSchema>
 export type CommentDeleteRequest = z.infer<typeof commentDeleteSchema>
+export type CommentFollowUpRequest = z.infer<typeof commentFollowUpSchema>
 export type QuestionClaimRequest = z.infer<typeof questionClaimRequestSchema>
 export type QuestionAnswerRequest = z.infer<typeof questionAnswerRequestSchema>
 export type QuestionFailRequest = z.infer<typeof questionFailRequestSchema>
@@ -144,6 +153,14 @@ export interface QuestionSummary {
   state: 'queued'
 }
 
+export type QuestionConversationMessage =
+  | { role: 'user'; content: string }
+  | {
+      role: 'assistant'
+      content: string
+      outcome: 'answered' | 'failed'
+    }
+
 export interface CommentResponse {
   ok: true
   question?: QuestionSummary
@@ -151,10 +168,12 @@ export interface CommentResponse {
 
 export interface QuestionJob {
   id: string
+  threadId: string
   backend: AgentBackend
   file: string
   line: number
   question: string
+  messages: QuestionConversationMessage[]
   excerpt: string
   lineText: string
   commentOpenLine: number
@@ -173,6 +192,7 @@ export interface QuestionClaim {
   file: string
   line: number
   question: string
+  messages: QuestionConversationMessage[]
   excerpt: string
   lineText: string
   leaseId: string
