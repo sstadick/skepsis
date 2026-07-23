@@ -17,12 +17,42 @@ import {
   reviewTagRegex,
 } from '../shared/reviewComments.ts'
 
+function renderCommentLines(syntax: CommentSyntax, indent: string, text: string): string[] {
+  const { prefix, suffix } = syntax
+  const wrap = (body: string) => indent + [prefix, body, suffix].filter(Boolean).join(' ')
+  return [
+    wrap(REVIEW_OPEN_TAG),
+    ...text.split('\n').map((line) => wrap(line)),
+    wrap(REVIEW_CLOSE_TAG),
+  ]
+}
+
+function findCommentRange(
+  lines: string[],
+  syntax: CommentSyntax,
+  line: number,
+): { end: number } {
+  const openRe = reviewTagRegex(syntax, REVIEW_OPEN_TAG)
+  const closeRe = reviewTagRegex(syntax, REVIEW_CLOSE_TAG)
+
+  if (!openRe.test(lines[line - 1]!)) {
+    throw new Error(`Line ${line} is not a <review> open tag`)
+  }
+
+  let end = line
+  while (end < lines.length && !closeRe.test(lines[end]!)) end++
+  if (end >= lines.length) {
+    throw new Error(`No </review> close tag found after line ${line}`)
+  }
+  return { end }
+}
+
 export async function insertComment(
   cwd: string,
   file: string,
   afterLine: number,
   text: string,
-): Promise<void> {
+): Promise<{ openLine: number }> {
   const filePath = join(cwd, file)
   const content = await readFile(filePath, 'utf-8')
   const lines = content.split('\n')
@@ -31,22 +61,36 @@ export async function insertComment(
     throw new Error(`Line ${afterLine} out of range (file has ${lines.length} lines)`)
   }
 
-  // Match indentation of the target line
   const targetLine = lines[afterLine - 1]!
   const indent = targetLine.match(/^(\s*)/)?.[1] ?? ''
   const syntax: CommentSyntax = getCommentSyntax(file, lines[0] ?? '') ?? BARE_COMMENT
-  const { prefix, suffix } = syntax
-  // prefix may be empty (bare fallback for unknown file types), so join only
-  // the non-empty parts
-  const wrap = (body: string) => indent + [prefix, body, suffix].filter(Boolean).join(' ')
-
-  const commentLines = [
-    wrap(REVIEW_OPEN_TAG),
-    ...text.split('\n').map((line) => wrap(line)),
-    wrap(REVIEW_CLOSE_TAG),
-  ]
+  const commentLines = renderCommentLines(syntax, indent, text)
 
   lines.splice(afterLine, 0, ...commentLines)
+  await writeFile(filePath, lines.join('\n'))
+  return { openLine: afterLine + 1 }
+}
+
+export async function replaceComment(
+  cwd: string,
+  file: string,
+  line: number,
+  text: string,
+): Promise<void> {
+  const filePath = join(cwd, file)
+  const content = await readFile(filePath, 'utf-8')
+  const lines = content.split('\n')
+
+  if (line < 1 || line > lines.length) {
+    throw new Error(`Line ${line} out of range`)
+  }
+
+  const syntax = getCommentSyntax(file, lines[0] ?? '') ?? BARE_COMMENT
+  const { end } = findCommentRange(lines, syntax, line)
+  const indent = lines[line - 1]!.match(/^(\s*)/)?.[1] ?? ''
+  const commentLines = renderCommentLines(syntax, indent, text)
+
+  lines.splice(line - 1, end - line + 2, ...commentLines)
   await writeFile(filePath, lines.join('\n'))
 }
 
@@ -64,19 +108,7 @@ export async function removeComment(
   }
 
   const syntax = getCommentSyntax(file, lines[0] ?? '') ?? BARE_COMMENT
-  const openRe = reviewTagRegex(syntax, REVIEW_OPEN_TAG)
-  const closeRe = reviewTagRegex(syntax, REVIEW_CLOSE_TAG)
-
-  if (!openRe.test(lines[line - 1]!)) {
-    throw new Error(`Line ${line} is not a <review> open tag`)
-  }
-
-  let end = line
-  while (end < lines.length && !closeRe.test(lines[end]!)) end++
-  if (end >= lines.length) {
-    throw new Error(`No </review> close tag found after line ${line}`)
-  }
-
+  const { end } = findCommentRange(lines, syntax, line)
   lines.splice(line - 1, end - line + 2)
   await writeFile(filePath, lines.join('\n'))
 }

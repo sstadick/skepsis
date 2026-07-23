@@ -36,6 +36,24 @@ export const commentDeleteSchema = z.object({
   line: z.number(),
 })
 
+export const AGENT_BACKENDS = ['pi', 'claude', 'codex'] as const
+export type AgentBackend = (typeof AGENT_BACKENDS)[number]
+
+export const questionClaimRequestSchema = z.object({
+  backend: z.enum(AGENT_BACKENDS).optional(),
+  worker: z.string().optional(),
+})
+
+export const questionAnswerRequestSchema = z.object({
+  leaseId: z.string(),
+  answer: z.string(),
+})
+
+export const questionFailRequestSchema = z.object({
+  leaseId: z.string(),
+  error: z.string(),
+})
+
 export const fileContentsQuerySchema = z.object({
   path: z.string(),
   // Present for renamed files: the path to fetch the old-side content from.
@@ -47,6 +65,9 @@ export const fileContentsQuerySchema = z.object({
 export type ViewedRequest = z.infer<typeof viewedRequestSchema>
 export type CommentRequest = z.infer<typeof commentRequestSchema>
 export type CommentDeleteRequest = z.infer<typeof commentDeleteSchema>
+export type QuestionClaimRequest = z.infer<typeof questionClaimRequestSchema>
+export type QuestionAnswerRequest = z.infer<typeof questionAnswerRequestSchema>
+export type QuestionFailRequest = z.infer<typeof questionFailRequestSchema>
 
 // --- UI types ---
 
@@ -115,6 +136,50 @@ export interface DiffResponse {
 export interface FileContentsResponse {
   oldContents: string | null
   newContents: string | null
+}
+
+export interface QuestionSummary {
+  id: string
+  backend: AgentBackend
+  state: 'queued'
+}
+
+export interface CommentResponse {
+  ok: true
+  question?: QuestionSummary
+}
+
+export interface QuestionJob {
+  id: string
+  backend: AgentBackend
+  file: string
+  line: number
+  question: string
+  excerpt: string
+  lineText: string
+  commentOpenLine: number
+  state: 'queued' | 'claimed' | 'answered' | 'failed'
+  createdAt: number
+  claimedAt?: number
+  claimedBy?: string
+  leaseId?: string
+  answer?: string
+  error?: string
+}
+
+export interface QuestionClaim {
+  id: string
+  backend: AgentBackend
+  file: string
+  line: number
+  question: string
+  excerpt: string
+  lineText: string
+  leaseId: string
+}
+
+export interface QuestionClaimResponse {
+  question: QuestionClaim | null
 }
 
 export interface ErrorResponse {

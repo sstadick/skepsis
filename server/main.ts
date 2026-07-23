@@ -17,14 +17,14 @@ import { getDiff } from './diff.ts'
 import { displayCommand } from './displayCommand.ts'
 import { getFileContents } from './fileContents.ts'
 import { loadViewed, markViewed, unmarkViewed, unmarkViewedAll } from './viewed.ts'
-import { insertComment, removeComment } from './comment.ts'
+import { insertComment, removeComment, replaceComment } from './comment.ts'
+import { clearServerInfo, createServerToken, writeServerInfo } from './discovery.ts'
 import {
-  appendPiAnswer,
-  askPiQuestion,
+  appendQuestionAnswer,
   getQuestionContext,
-  type AgentBridgeConfig,
-  parsePiQuestion,
-} from './agentBridge.ts'
+  parseAgentQuestion,
+  QuestionStore,
+} from './questions.ts'
 import { getCommentSyntaxes } from './commentSyntax.ts'
 import { loadTheme, saveTheme, themeBootScript } from './settings.ts'
 import {
@@ -33,14 +33,19 @@ import {
   viewedDeleteAllSchema,
   commentRequestSchema,
   commentDeleteSchema,
+  questionClaimRequestSchema,
+  questionAnswerRequestSchema,
+  questionFailRequestSchema,
   fileContentsQuerySchema,
   themeRequestSchema,
 } from '../shared/types.ts'
 import type {
+  CommentResponse,
   DiffResponse,
+  ErrorResponse,
   FileContentsResponse,
   OkResponse,
-  ErrorResponse,
+  QuestionClaimResponse,
   ThemeResponse,
 } from '../shared/types.ts'
 
@@ -49,14 +54,19 @@ export async function startServer(opts: {
   port?: number
   hostname?: string
   cwd: string
-  agentBridge?: AgentBridgeConfig
 }): Promise<{ port: number; close: () => void }> {
-  const { diffSource, port = 0, hostname = 'localhost', cwd, agentBridge } = opts
+  const { diffSource, port = 0, hostname = 'localhost', cwd } = opts
   // Fail fast on bad args by running the exact diff command we'll serve.
   // Result is discarded: /api/diff re-runs it per request to stay fresh.
   await getDiff(diffSource)
 
   const app = new Hono()
+  const questions = new QuestionStore()
+  const serverToken = createServerToken()
+
+  function unauthorized(auth: string | undefined): ErrorResponse | null {
+    return auth === `Bearer ${serverToken}` ? null : { error: 'Unauthorized' }
+  }
 
   app.get('/api/diff', async (c) => {
     const { patch, fileHashes } = await getDiff(diffSource)
@@ -102,20 +112,24 @@ export async function startServer(opts: {
 
   app.post('/api/comment', zValidator('json', commentRequestSchema), async (c) => {
     const { file, afterLine, text } = c.req.valid('json')
-    const question = parsePiQuestion(text)
-    const body = question
-      ? appendPiAnswer(
-          text,
-          await askPiQuestion(agentBridge, {
-            file,
-            line: afterLine,
-            question,
-            ...(await getQuestionContext(cwd, file, afterLine)),
-          }),
-        )
-      : text
-    await insertComment(cwd, file, afterLine, body)
-    return c.json({ ok: true } satisfies OkResponse)
+    const inserted = await insertComment(cwd, file, afterLine, text)
+    const parsed = parseAgentQuestion(text)
+    if (!parsed) return c.json({ ok: true } satisfies CommentResponse)
+
+    const context = await getQuestionContext(cwd, file, afterLine)
+    const job = questions.enqueue({
+      backend: parsed.backend,
+      file,
+      line: afterLine,
+      question: parsed.question,
+      ...context,
+      commentOpenLine: inserted.openLine,
+      commentBody: text,
+    })
+    return c.json({
+      ok: true,
+      question: { id: job.id, backend: job.backend, state: 'queued' },
+    } satisfies CommentResponse)
   })
 
   app.delete('/api/comment', zValidator('json', commentDeleteSchema), async (c) => {
@@ -123,6 +137,51 @@ export async function startServer(opts: {
     await removeComment(cwd, file, line)
     return c.json({ ok: true } satisfies OkResponse)
   })
+
+  app.post(
+    '/api/questions/claim',
+    zValidator('json', questionClaimRequestSchema),
+    async (c) => {
+      const err = unauthorized(c.req.header('authorization'))
+      if (err) return c.json(err satisfies ErrorResponse, 401)
+      const { backend, worker } = c.req.valid('json')
+      return c.json({
+        question: questions.claim(backend, worker),
+      } satisfies QuestionClaimResponse)
+    },
+  )
+
+  app.post(
+    '/api/questions/:id/answer',
+    zValidator('json', questionAnswerRequestSchema),
+    async (c) => {
+      const err = unauthorized(c.req.header('authorization'))
+      if (err) return c.json(err satisfies ErrorResponse, 401)
+      const { leaseId, answer } = c.req.valid('json')
+      const job = questions.getClaimed(c.req.param('id'), leaseId)
+      await replaceComment(
+        cwd,
+        job.file,
+        job.commentOpenLine,
+        appendQuestionAnswer(job.commentBody, answer),
+      )
+      questions.markAnswered(job.id, answer)
+      return c.json({ ok: true } satisfies OkResponse)
+    },
+  )
+
+  app.post(
+    '/api/questions/:id/fail',
+    zValidator('json', questionFailRequestSchema),
+    async (c) => {
+      const err = unauthorized(c.req.header('authorization'))
+      if (err) return c.json(err satisfies ErrorResponse, 401)
+      const { leaseId, error } = c.req.valid('json')
+      const job = questions.getClaimed(c.req.param('id'), leaseId)
+      questions.markFailed(job.id, error)
+      return c.json({ ok: true } satisfies OkResponse)
+    },
+  )
 
   app.get('/api/theme', async (c) => {
     return c.json({ theme: await loadTheme() } satisfies ThemeResponse)
@@ -160,13 +219,24 @@ export async function startServer(opts: {
     return c.json({ error: err.message } satisfies ErrorResponse, 500)
   })
 
-  return new Promise((resolve) => {
-    const server = serve({ fetch: app.fetch, port, hostname }, (info) => {
-      const assignedPort = typeof info === 'string' ? port : info.port
-      console.info(
-        `skepsis on http://${hostname}:${assignedPort} (${displayCommand(diffSource)})`,
-      )
-      resolve({ port: assignedPort, close: () => server.close() })
+  return new Promise((resolve, reject) => {
+    const server = serve({ fetch: app.fetch, port, hostname }, async (info) => {
+      try {
+        const assignedPort = typeof info === 'string' ? port : info.port
+        const url = `http://${hostname}:${assignedPort}`
+        await writeServerInfo(cwd, { url, token: serverToken })
+        console.info(`skepsis on ${url} (${displayCommand(diffSource)})`)
+        resolve({
+          port: assignedPort,
+          close: () => {
+            void clearServerInfo(cwd, { url, token: serverToken })
+            server.close()
+          },
+        })
+      } catch (error) {
+        server.close()
+        reject(error)
+      }
     })
   })
 }

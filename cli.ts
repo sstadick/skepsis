@@ -11,34 +11,33 @@ import { spawn, execFileSync } from 'child_process'
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { Command } from '@commander-js/extra-typings'
+import { readServerInfo } from './server/discovery.ts'
 import { startServer } from './server/main.ts'
-import type { DiffArgs, DiffEndpoints } from './shared/types.ts'
+import { AGENT_BACKENDS } from './shared/types.ts'
+import type {
+  AgentBackend,
+  DiffArgs,
+  DiffEndpoints,
+  ErrorResponse,
+  OkResponse,
+  QuestionClaim,
+  QuestionClaimResponse,
+} from './shared/types.ts'
 
-const program = new Command()
-  .name('skepsis')
-  .description('Local diff review UI (auto-detects jj or git)')
-  .option('-r, --revisions <revsets>', 'Show changes in these revisions')
-  .option('-f, --from <rev>', 'Show changes from this revision')
-  .option('-t, --to <rev>', 'Show changes to this revision')
-  .option('--git', 'force git mode (skip jj detection)')
-  .option('--dev', 'run with Vite dev server for development')
-  .option('--host <address>', 'address to bind the HTTP server to', 'localhost')
-  .option('--agent-bridge-url <url>', 'URL of a pi bridge for @pi review comments')
-  .option('--agent-bridge-token <token>', 'bearer token for the pi bridge')
-  .argument('[files...]', 'Limit diff to these paths (passed through to jj/git)')
-  .parse()
+interface ServeOptions {
+  revisions?: string
+  from?: string
+  to?: string
+  git?: boolean
+  dev?: boolean
+  host: string
+}
 
-const opts = program.opts()
-const files = program.processedArgs[0] ?? []
-const hostname = opts.host
-const agentBridgeUrl = opts.agentBridgeUrl ?? process.env['SKEPSIS_AGENT_BRIDGE_URL']
-const agentBridge =
-  agentBridgeUrl == null
-    ? undefined
-    : {
-        url: agentBridgeUrl,
-        token: opts.agentBridgeToken ?? process.env['SKEPSIS_AGENT_BRIDGE_TOKEN'],
-      }
+interface QueueOptions {
+  cwd?: string
+  server?: string
+  token?: string
+}
 
 function detectVcs(): 'jj' | 'git' {
   try {
@@ -53,8 +52,6 @@ function detectVcs(): 'jj' | 'git' {
     }
   }
 }
-
-const vcs = opts.git ? 'git' : detectVcs()
 
 /* Base rev candidates for the default git diff. A remote's default branch
  * (origin/HEAD) is optional — "Having a default branch for a remote is not
@@ -81,10 +78,6 @@ function resolveGitBase(): { base: string; mergeBase: string } {
       }).trim()
       return { base, mergeBase }
     } catch (error) {
-      // A missing candidate or no common ancestor means try the next one, but
-      // outside a repo or without git installed every candidate fails the
-      // same way — git's own error beats a misleading "no base revision
-      // found" that suggests -r/-f flags that would also fail.
       const { code, stderr } = error as { code?: string; stderr?: string }
       if (code === 'ENOENT' || stderr?.includes('not a git repository')) {
         console.error(stderr?.trim() || (error as Error).message)
@@ -110,97 +103,68 @@ function parseRange(rev: string): { left: string; right: string } | null {
   return { left, right }
 }
 
-function buildDiffSource(): DiffArgs {
+function buildDiffSource(opts: ServeOptions, files: string[], vcs: 'jj' | 'git'): DiffArgs {
   if (vcs === 'jj') {
     const args: string[] = []
     let commentsEnabled: boolean
     let endpoints: DiffEndpoints
     if (opts.from || opts.to || !opts.revisions) {
-      // With no range flags at all, --from defaults to a GitHub-PR-style diff
-      // from the fork point of trunk and @. Same output as `-r 'trunk()..@'`
-      // for a linear branch, but still works after trunk has been merged into
-      // the branch, where jj rejects `trunk()..@` ("Cannot diff revsets with
-      // gaps in"). fork_point() requires jj >= 0.24
-      // (https://github.com/jj-vcs/jj/releases/tag/v0.24.0).
       const from = opts.from ?? (opts.to ? undefined : 'fork_point(trunk() | @)')
       if (from) args.push('--from', from)
       if (opts.to) args.push('--to', opts.to)
-      // Comments enabled if --to is @ or omitted (jj defaults --to to @)
       commentsEnabled = !opts.to || opts.to === '@'
-      // jj defaults both --from and --to to @
       endpoints = { left: from ?? '@', right: { rev: opts.to ?? '@' } }
     } else {
       const rev = opts.revisions
       args.push('-r', rev)
-      // Comments enabled if the revset's "to" side is @
       commentsEnabled = rev === '@' || rev.endsWith('..@')
       const range = parseRange(rev)
       if (range) {
         endpoints = { left: range.left, right: { rev: range.right } }
       } else if (!rev.includes('..')) {
-        // Single rev: `jj diff -r R` shows R's own change, i.e. R-..R.
         endpoints = { left: `${rev}-`, right: { rev } }
       } else {
         endpoints = null
       }
     }
     return { vcs: 'jj', args, commentsEnabled, files, endpoints }
-  } else {
-    let args: string[]
-    let commentsEnabled: boolean
-    let endpoints: DiffEndpoints
-    let displayArgs: string[] | undefined
-    if (opts.from || opts.to) {
-      if (opts.to) {
-        // Explicit --to: commit-to-commit diff, no working copy
-        args = [opts.from ?? 'HEAD', opts.to]
-        commentsEnabled = false
-        endpoints = { left: opts.from ?? 'HEAD', right: { rev: opts.to } }
-      } else {
-        // --from only: git diff <from> includes working tree
-        args = [opts.from!]
-        commentsEnabled = true
-        endpoints = { left: opts.from!, right: 'workingCopy' }
-      }
-    } else if (!opts.revisions) {
-      // Default: the git translation of the jj default — diff the working
-      // tree against the branch's fork point from trunk (the merge base of
-      // the resolved base and HEAD). Using the merge base keeps upstream
-      // commits the branch doesn't have from showing up as reversions, and
-      // ending at the working tree means review comments work out of the box.
-      // Diffing against the resolved sha rather than `git diff --merge-base
-      // <base>` pins the diff and hunk expansion to the same commit — they
-      // can't drift apart if the base moves while the server runs — and
-      // avoids --merge-base's hard error when there are multiple merge bases.
-      // The sha is unreadable, so show the equivalent symbolic command in the
-      // UI and log.
-      const { base, mergeBase } = resolveGitBase()
-      args = [mergeBase]
-      displayArgs = ['--merge-base', base]
-      commentsEnabled = true
-      endpoints = { left: mergeBase, right: 'workingCopy' }
-    } else {
-      const rev = opts.revisions
-      // No .. means single ref, which diffs against working tree
-      commentsEnabled = !rev.includes('..')
-      args = [rev]
-      const range = parseRange(rev)
-      if (range) {
-        endpoints = { left: range.left, right: { rev: range.right } }
-      } else if (!rev.includes('..')) {
-        endpoints = { left: rev, right: 'workingCopy' }
-      } else {
-        endpoints = null
-      }
-    }
-    return { vcs: 'git', args, commentsEnabled, files, endpoints, displayArgs }
   }
+
+  let args: string[]
+  let commentsEnabled: boolean
+  let endpoints: DiffEndpoints
+  let displayArgs: string[] | undefined
+  if (opts.from || opts.to) {
+    if (opts.to) {
+      args = [opts.from ?? 'HEAD', opts.to]
+      commentsEnabled = false
+      endpoints = { left: opts.from ?? 'HEAD', right: { rev: opts.to } }
+    } else {
+      args = [opts.from!]
+      commentsEnabled = true
+      endpoints = { left: opts.from!, right: 'workingCopy' }
+    }
+  } else if (!opts.revisions) {
+    const { base, mergeBase } = resolveGitBase()
+    args = [mergeBase]
+    displayArgs = ['--merge-base', base]
+    commentsEnabled = true
+    endpoints = { left: mergeBase, right: 'workingCopy' }
+  } else {
+    const rev = opts.revisions
+    commentsEnabled = !rev.includes('..')
+    args = [rev]
+    const range = parseRange(rev)
+    if (range) {
+      endpoints = { left: range.left, right: { rev: range.right } }
+    } else if (!rev.includes('..')) {
+      endpoints = { left: rev, right: 'workingCopy' }
+    } else {
+      endpoints = null
+    }
+  }
+  return { vcs: 'git', args, commentsEnabled, files, endpoints, displayArgs }
 }
-
-const diffSource = buildDiffSource()
-
-const cwd = process.cwd()
-const children: ReturnType<typeof spawn>[] = []
 
 function findCheckoutRoot(): string | null {
   const sourceRoot = import.meta.dirname
@@ -212,28 +176,14 @@ function findCheckoutRoot(): string | null {
   return null
 }
 
-function cleanup(code = 0): never {
-  for (const child of children) child.kill()
-  process.exit(code)
-}
-
 function requireCheckoutRoot(): string {
   const checkoutRoot = findCheckoutRoot()
-  if (checkoutRoot === null) {
-    console.error(
-      '--dev only works from a skepsis source checkout, not the installed package.\n' +
-        'Clone https://github.com/oxidecomputer/skepsis and run: node cli.ts --dev',
-    )
-    cleanup(1)
-  }
-  return checkoutRoot
+  if (checkoutRoot !== null) return checkoutRoot
+  throw new Error(
+    '--dev only works from a skepsis source checkout, not the installed package.\n' +
+      'Clone https://github.com/oxidecomputer/skepsis and run: node cli.ts --dev',
+  )
 }
-
-process.on('SIGINT', () => cleanup())
-process.on('SIGTERM', () => cleanup())
-
-const checkoutRoot = opts.dev ? requireCheckoutRoot() : undefined
-const { port: apiPort } = await startServer({ diffSource, cwd, hostname, agentBridge })
 
 function urlOpenCommand(url: string): { cmd: string; args: string[] } {
   switch (process.platform) {
@@ -246,26 +196,219 @@ function urlOpenCommand(url: string): { cmd: string; args: string[] } {
   }
 }
 
-// Only auto-open a browser when bound to localhost. With any other host,
-// the user is likely on a remote dev box and the browser lives elsewhere
-// — opening locally would just spawn an unwanted browser.
-const shouldAutoOpen = hostname === 'localhost'
+async function runServe(files: string[], opts: ServeOptions): Promise<void> {
+  const hostname = opts.host
+  const vcs = opts.git ? 'git' : detectVcs()
+  const diffSource = buildDiffSource(opts, files, vcs)
+  const cwd = process.cwd()
+  const children: ReturnType<typeof spawn>[] = []
 
-if (opts.dev) {
-  const viteArgs = ['vite', '--host', hostname]
-  if (shouldAutoOpen) viteArgs.push('--open')
-  const vite = spawn('npx', viteArgs, {
-    cwd: checkoutRoot,
-    stdio: 'inherit',
-    env: { ...process.env, API_HOST: hostname, API_PORT: String(apiPort) },
-  })
-  children.push(vite)
-} else if (shouldAutoOpen) {
-  const url = `http://localhost:${apiPort}`
-  const { cmd, args } = urlOpenCommand(url)
-  const opener = spawn(cmd, args, { detached: true, stdio: 'ignore' })
-  // The URL is already printed on server startup, so a failed opener (e.g. no
-  // xdg-open on illumos) needs no message — swallow the error and carry on.
-  opener.on('error', () => {})
-  opener.unref()
+  function cleanup(code = 0): never {
+    for (const child of children) child.kill()
+    process.exit(code)
+  }
+
+  process.on('SIGINT', () => cleanup())
+  process.on('SIGTERM', () => cleanup())
+
+  const checkoutRoot = opts.dev ? requireCheckoutRoot() : undefined
+  const { port: apiPort } = await startServer({ diffSource, cwd, hostname })
+
+  const shouldAutoOpen = hostname === 'localhost'
+  if (opts.dev) {
+    const viteArgs = ['vite', '--host', hostname]
+    if (shouldAutoOpen) viteArgs.push('--open')
+    const vite = spawn('npx', viteArgs, {
+      cwd: checkoutRoot,
+      stdio: 'inherit',
+      env: { ...process.env, API_HOST: hostname, API_PORT: String(apiPort) },
+    })
+    children.push(vite)
+  } else if (shouldAutoOpen) {
+    const url = `http://localhost:${apiPort}`
+    const { cmd, args } = urlOpenCommand(url)
+    const opener = spawn(cmd, args, { detached: true, stdio: 'ignore' })
+    opener.on('error', () => {})
+    opener.unref()
+  }
 }
+
+async function readStdin(): Promise<string> {
+  const chunks: Uint8Array[] = []
+  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk))
+  return Buffer.concat(chunks).toString('utf-8')
+}
+
+async function resolveServerAccess(
+  opts: QueueOptions,
+): Promise<{ url: string; token: string }> {
+  const url = opts.server ?? process.env['SKEPSIS_SERVER_URL']
+  const token = opts.token ?? process.env['SKEPSIS_SERVER_TOKEN']
+  if (url && token) return { url, token }
+
+  const cwd = opts.cwd ?? process.cwd()
+  try {
+    const discovered = await readServerInfo(cwd)
+    return { url: url ?? discovered.url, token: token ?? discovered.token }
+  } catch (error) {
+    if (url && token) return { url, token }
+    throw new Error(
+      `No running Skepsis server discovered for ${cwd}. Start Skepsis there first or pass --server/--token.`,
+      { cause: error },
+    )
+  }
+}
+
+async function apiFetch<T>(
+  endpoint: string,
+  init: { method: string; body?: unknown; access: { url: string; token: string } },
+): Promise<T> {
+  const res = await fetch(new URL(endpoint, init.access.url), {
+    method: init.method,
+    headers: {
+      authorization: `Bearer ${init.access.token}`,
+      'content-type': 'application/json',
+    },
+    body: init.body === undefined ? undefined : JSON.stringify(init.body),
+  })
+  if (!res.ok) {
+    const error = (await res.json().catch(() => null)) as ErrorResponse | null
+    throw new Error(error?.error ?? `Request failed (${res.status})`)
+  }
+  return res.json() as Promise<T>
+}
+
+function parseBackend(raw: string | undefined): AgentBackend | undefined {
+  if (raw == null) return undefined
+  if ((AGENT_BACKENDS as readonly string[]).includes(raw)) return raw as AgentBackend
+  throw new Error(`Unknown backend: ${raw}`)
+}
+
+function printQuestion(question: QuestionClaim, asJson: boolean): void {
+  if (asJson) {
+    process.stdout.write(JSON.stringify(question) + '\n')
+    return
+  }
+  process.stdout.write(
+    [
+      `id: ${question.id}`,
+      `backend: ${question.backend}`,
+      `file: ${question.file}`,
+      `line: ${question.line}`,
+      `lease: ${question.leaseId}`,
+      `question: ${question.question}`,
+      '',
+      question.excerpt,
+      '',
+    ].join('\n'),
+  )
+}
+
+const program = new Command()
+  .name('skepsis')
+  .description('Local diff review UI and review-question queue')
+
+program
+  .argument('[files...]', 'Limit diff to these paths (passed through to jj/git)')
+  .option('-r, --revisions <revsets>', 'Show changes in these revisions')
+  .option('-f, --from <rev>', 'Show changes from this revision')
+  .option('-t, --to <rev>', 'Show changes to this revision')
+  .option('--git', 'force git mode (skip jj detection)')
+  .option('--dev', 'run with Vite dev server for development')
+  .option('--host <address>', 'address to bind the HTTP server to', 'localhost')
+  .action(async (files: string[], opts: ServeOptions) => {
+    await runServe(files, opts)
+  })
+
+program
+  .command('poll')
+  .description('Claim one queued review question for an agent backend')
+  .option('--backend <backend>', 'limit to a specific backend (pi, claude, codex)')
+  .option('--worker <name>', 'worker name recorded on the claim', `${process.pid}`)
+  .option('--json', 'print the claimed question as JSON')
+  .option('--cwd <path>', 'repository cwd used for server discovery')
+  .option('--server <url>', 'explicit Skepsis server URL')
+  .option('--token <token>', 'explicit Skepsis server token')
+  .action(
+    async (opts: {
+      backend?: string
+      worker: string
+      json?: boolean
+      cwd?: string
+      server?: string
+      token?: string
+    }) => {
+      const access = await resolveServerAccess(opts)
+      const res = await apiFetch<QuestionClaimResponse>('/api/questions/claim', {
+        method: 'POST',
+        access,
+        body: { backend: parseBackend(opts.backend), worker: opts.worker },
+      })
+      if (!res.question) return
+      printQuestion(res.question, opts.json ?? false)
+    },
+  )
+
+program
+  .command('answer')
+  .description('Answer a claimed review question')
+  .argument('<id>', 'question id')
+  .requiredOption('--lease <leaseId>', 'lease returned from skepsis poll')
+  .option('--text <answer>', 'answer text')
+  .option('--stdin', 'read answer text from stdin')
+  .option('--cwd <path>', 'repository cwd used for server discovery')
+  .option('--server <url>', 'explicit Skepsis server URL')
+  .option('--token <token>', 'explicit Skepsis server token')
+  .action(
+    async (
+      id: string,
+      opts: {
+        lease: string
+        text?: string
+        stdin?: boolean
+        cwd?: string
+        server?: string
+        token?: string
+      },
+    ) => {
+      const answer = opts.stdin ? await readStdin() : opts.text
+      if (!answer?.trim()) throw new Error('Provide answer text with --text or --stdin')
+      const access = await resolveServerAccess(opts)
+      await apiFetch<OkResponse>(`/api/questions/${id}/answer`, {
+        method: 'POST',
+        access,
+        body: { leaseId: opts.lease, answer },
+      })
+    },
+  )
+
+program
+  .command('fail')
+  .description('Mark a claimed review question as failed')
+  .argument('<id>', 'question id')
+  .requiredOption('--lease <leaseId>', 'lease returned from skepsis poll')
+  .requiredOption('--message <text>', 'failure message')
+  .option('--cwd <path>', 'repository cwd used for server discovery')
+  .option('--server <url>', 'explicit Skepsis server URL')
+  .option('--token <token>', 'explicit Skepsis server token')
+  .action(
+    async (
+      id: string,
+      opts: {
+        lease: string
+        message: string
+        cwd?: string
+        server?: string
+        token?: string
+      },
+    ) => {
+      const access = await resolveServerAccess(opts)
+      await apiFetch<OkResponse>(`/api/questions/${id}/fail`, {
+        method: 'POST',
+        access,
+        body: { leaseId: opts.lease, error: opts.message },
+      })
+    },
+  )
+
+await program.parseAsync()

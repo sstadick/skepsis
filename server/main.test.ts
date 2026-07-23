@@ -6,8 +6,6 @@
  * Copyright Oxide Computer Company
  */
 
-import { createServer } from 'node:http'
-import type { AddressInfo } from 'node:net'
 import { appendFile, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -18,6 +16,7 @@ import { exec, isolateVcsConfig, requireJj } from './testUtil.ts'
 // HOME is also where viewed state is stored, and it's read at module load —
 // so isolation must run before main.ts is imported, hence the dynamic import.
 const home = await isolateVcsConfig()
+const { readServerInfo } = await import('./discovery.ts')
 const { startServer } = await import('./main.ts')
 
 afterAll(async () => {
@@ -35,8 +34,7 @@ describe.each(['git', 'jj'] as const)('startServer (%s integration)', (vcs) => {
   let origCwd: string
   let close: (() => void) | undefined
   let url: string
-  let bridgeClose: (() => void) | undefined
-  let bridgeRequests: unknown[]
+  let serverInfo: Awaited<ReturnType<typeof readServerInfo>>
 
   const run = (cmd: string, args: string[]) => exec(cmd, args, { cwd: dir })
 
@@ -68,28 +66,6 @@ describe.each(['git', 'jj'] as const)('startServer (%s integration)', (vcs) => {
     origCwd = process.cwd()
     process.chdir(dir)
 
-    bridgeRequests = []
-    const bridge = createServer(async (req, res) => {
-      const chunks: Uint8Array[] = []
-      for await (const chunk of req) chunks.push(Buffer.from(chunk))
-      if (req.headers['authorization'] !== 'Bearer test-token') {
-        res.writeHead(401, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ error: 'unauthorized' }))
-        return
-      }
-      if (req.method !== 'POST' || req.url !== '/question') {
-        res.writeHead(404)
-        res.end()
-        return
-      }
-      bridgeRequests.push(JSON.parse(Buffer.concat(chunks).toString('utf-8')))
-      res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ answer: 'Because the bridge said so.' }))
-    })
-    await new Promise<void>((resolve) => bridge.listen(0, '127.0.0.1', resolve))
-    bridgeClose = () => bridge.close()
-    const bridgeUrl = `http://127.0.0.1:${(bridge.address() as AddressInfo).port}`
-
     const base = { commentsEnabled: true, files: [] }
     const diffSource: DiffArgs =
       vcs === 'git'
@@ -105,18 +81,14 @@ describe.each(['git', 'jj'] as const)('startServer (%s integration)', (vcs) => {
             ...base,
             endpoints: { left: '@-', right: { rev: '@' } },
           }
-    const started = await startServer({
-      diffSource,
-      cwd: dir,
-      agentBridge: { url: bridgeUrl, token: 'test-token' },
-    })
+    const started = await startServer({ diffSource, cwd: dir })
     close = started.close
     url = `http://localhost:${started.port}`
+    serverInfo = await readServerInfo(dir)
   })
 
   afterAll(async () => {
     close?.()
-    bridgeClose?.()
     if (origCwd) process.chdir(origCwd)
     if (dir) await rm(dir, { recursive: true, force: true })
   })
@@ -131,6 +103,17 @@ describe.each(['git', 'jj'] as const)('startServer (%s integration)', (vcs) => {
     return fetch(`${url}${path}`, {
       method,
       headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  }
+
+  async function queueApi(method: string, path: string, body: unknown): Promise<Response> {
+    return fetch(`${url}${path}`, {
+      method,
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${serverInfo.token}`,
+      },
       body: JSON.stringify(body),
     })
   }
@@ -232,25 +215,75 @@ describe.each(['git', 'jj'] as const)('startServer (%s integration)', (vcs) => {
     )
   })
 
-  it('answers @pi review comments through the bridge before inserting them', async () => {
+  it('queues and answers @pi review comments asynchronously', async () => {
     const res = await api('POST', '/api/comment', {
       file: 'g.txt',
       afterLine: 2,
       text: '@pi why add four?',
     })
-    expect(await res.json()).toEqual({ ok: true })
-    expect(bridgeRequests).toEqual([
-      {
-        file: 'g.txt',
-        line: 2,
-        question: 'why add four?',
-        lineText: 'two',
-        excerpt: '  1 | one\n> 2 | two\n  3 | three\n  4 | four\n  5 | ',
-      },
-    ])
+    expect(await res.json()).toEqual({
+      ok: true,
+      question: { backend: 'pi', id: expect.any(String), state: 'queued' },
+    })
     expect(await readFile(join(dir, 'g.txt'), 'utf-8')).toBe(
-      'one\ntwo\n<review>\n@pi why add four?\n\nAnswer:\nBecause the bridge said so.\n</review>\nthree\nfour\n',
+      'one\ntwo\n<review>\n@pi why add four?\n</review>\nthree\nfour\n',
     )
+
+    const claim = await queueApi('POST', '/api/questions/claim', {
+      backend: 'pi',
+      worker: 'test',
+    })
+    expect(claim.status).toBe(200)
+    const claimed = (await claim.json()) as {
+      question: {
+        id: string
+        file: string
+        line: number
+        question: string
+        lineText: string
+        excerpt: string
+        leaseId: string
+      }
+    }
+    expect(claimed.question).toEqual({
+      id: expect.any(String),
+      file: 'g.txt',
+      line: 2,
+      question: 'why add four?',
+      lineText: 'two',
+      excerpt: '  1 | one\n> 2 | two\n  3 | three\n  4 | four\n  5 | ',
+      leaseId: expect.any(String),
+    })
+
+    const answer = await queueApi('POST', `/api/questions/${claimed.question.id}/answer`, {
+      leaseId: claimed.question.leaseId,
+      answer: 'Because the queue said so.',
+    })
+    expect(await answer.json()).toEqual({ ok: true })
+    expect(await readFile(join(dir, 'g.txt'), 'utf-8')).toBe(
+      'one\ntwo\n<review>\n@pi why add four?\n\nAnswer:\nBecause the queue said so.\n</review>\nthree\nfour\n',
+    )
+  })
+
+  it('marks queued questions failed', async () => {
+    const res = await api('POST', '/api/comment', {
+      file: 'g.txt',
+      afterLine: 2,
+      text: '@codex why add four?',
+    })
+    expect(res.status).toBe(200)
+
+    const claim = await queueApi('POST', '/api/questions/claim', {
+      backend: 'codex',
+      worker: 'test',
+    })
+    const claimed = (await claim.json()) as { question: { id: string; leaseId: string } }
+    const fail = await queueApi('POST', `/api/questions/${claimed.question.id}/fail`, {
+      leaseId: claimed.question.leaseId,
+      error: 'agent unavailable',
+    })
+    expect(await fail.json()).toEqual({ ok: true })
+    expect(await readFile(join(dir, 'g.txt'), 'utf-8')).toContain('@codex why add four?')
   })
 
   it('serves full file contents at both diff endpoints', async () => {
