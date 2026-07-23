@@ -18,6 +18,13 @@ import { displayCommand } from './displayCommand.ts'
 import { getFileContents } from './fileContents.ts'
 import { loadViewed, markViewed, unmarkViewed, unmarkViewedAll } from './viewed.ts'
 import { insertComment, removeComment } from './comment.ts'
+import {
+  appendPiAnswer,
+  askPiQuestion,
+  getQuestionContext,
+  type AgentBridgeConfig,
+  parsePiQuestion,
+} from './agentBridge.ts'
 import { getCommentSyntaxes } from './commentSyntax.ts'
 import { loadTheme, saveTheme, themeBootScript } from './settings.ts'
 import {
@@ -42,8 +49,9 @@ export async function startServer(opts: {
   port?: number
   hostname?: string
   cwd: string
+  agentBridge?: AgentBridgeConfig
 }): Promise<{ port: number; close: () => void }> {
-  const { diffSource, port = 0, hostname = 'localhost', cwd } = opts
+  const { diffSource, port = 0, hostname = 'localhost', cwd, agentBridge } = opts
   // Fail fast on bad args by running the exact diff command we'll serve.
   // Result is discarded: /api/diff re-runs it per request to stay fresh.
   await getDiff(diffSource)
@@ -94,7 +102,19 @@ export async function startServer(opts: {
 
   app.post('/api/comment', zValidator('json', commentRequestSchema), async (c) => {
     const { file, afterLine, text } = c.req.valid('json')
-    await insertComment(cwd, file, afterLine, text)
+    const question = parsePiQuestion(text)
+    const body = question
+      ? appendPiAnswer(
+          text,
+          await askPiQuestion(agentBridge, {
+            file,
+            line: afterLine,
+            question,
+            ...(await getQuestionContext(cwd, file, afterLine)),
+          }),
+        )
+      : text
+    await insertComment(cwd, file, afterLine, body)
     return c.json({ ok: true } satisfies OkResponse)
   })
 

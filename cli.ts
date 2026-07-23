@@ -23,12 +23,22 @@ const program = new Command()
   .option('--git', 'force git mode (skip jj detection)')
   .option('--dev', 'run with Vite dev server for development')
   .option('--host <address>', 'address to bind the HTTP server to', 'localhost')
+  .option('--agent-bridge-url <url>', 'URL of a pi bridge for @pi review comments')
+  .option('--agent-bridge-token <token>', 'bearer token for the pi bridge')
   .argument('[files...]', 'Limit diff to these paths (passed through to jj/git)')
   .parse()
 
 const opts = program.opts()
 const files = program.processedArgs[0] ?? []
 const hostname = opts.host
+const agentBridgeUrl = opts.agentBridgeUrl ?? process.env['SKEPSIS_AGENT_BRIDGE_URL']
+const agentBridge =
+  agentBridgeUrl == null
+    ? undefined
+    : {
+        url: agentBridgeUrl,
+        token: opts.agentBridgeToken ?? process.env['SKEPSIS_AGENT_BRIDGE_TOKEN'],
+      }
 
 function detectVcs(): 'jj' | 'git' {
   try {
@@ -223,7 +233,7 @@ process.on('SIGINT', () => cleanup())
 process.on('SIGTERM', () => cleanup())
 
 const checkoutRoot = opts.dev ? requireCheckoutRoot() : undefined
-const { port: apiPort } = await startServer({ diffSource, cwd, hostname })
+const { port: apiPort } = await startServer({ diffSource, cwd, hostname, agentBridge })
 
 function urlOpenCommand(url: string): { cmd: string; args: string[] } {
   switch (process.platform) {
