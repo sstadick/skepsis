@@ -284,11 +284,108 @@ function parseBackend(raw: string | undefined): AgentBackend | undefined {
   throw new Error(`Unknown backend: ${raw}`)
 }
 
+/** Undefined is one-shot, null waits indefinitely, and a number is a timeout. */
+function parsePollWait(raw: string | boolean | undefined): number | null | undefined {
+  if (raw === undefined || raw === false) return undefined
+  if (raw === true) return null
+
+  const seconds = Number(raw)
+  const milliseconds = seconds * 1000
+  if (!Number.isFinite(seconds) || seconds <= 0 || !Number.isFinite(milliseconds)) {
+    throw new Error('--wait must be a positive number of seconds')
+  }
+  return milliseconds
+}
+
+interface QueueEventStream {
+  nextQueued: () => Promise<void>
+  close: () => void
+}
+
+/**
+ * Subscribe before the initial claim so a question queued during that request
+ * cannot be missed. Subsequent claims happen only after a matching queue
+ * event, avoiding the old one-request-per-second idle loop.
+ */
+async function openQueueEventStream(
+  access: { url: string; token: string },
+  backend: AgentBackend | undefined,
+  signal: AbortSignal,
+): Promise<QueueEventStream> {
+  const res = await fetch(new URL('/api/events', access.url), {
+    headers: { authorization: `Bearer ${access.token}` },
+    signal,
+  })
+  if (!res.ok) throw new Error(`Event stream failed (${res.status})`)
+  if (!res.body) throw new Error('Event stream returned no response body')
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  return {
+    nextQueued: async () => {
+      // Event frames and chunks have independent boundaries, so retain the
+      // unfinished tail between reads and consume complete frames in order.
+      // oxlint-disable no-await-in-loop
+      while (true) {
+        const boundary = buffer.indexOf('\n\n')
+        if (boundary >= 0) {
+          const block = buffer.slice(0, boundary)
+          buffer = buffer.slice(boundary + 2)
+          const event = block
+            .split('\n')
+            .find((line) => line.startsWith('event: '))
+            ?.slice('event: '.length)
+          if (event !== 'review-changed') continue
+          const data = block
+            .split('\n')
+            .filter((line) => line.startsWith('data: '))
+            .map((line) => line.slice('data: '.length))
+            .join('\n')
+          const change = JSON.parse(data) as {
+            reason?: string
+            backend?: AgentBackend
+          }
+          if (
+            change.reason === 'queued' &&
+            (backend === undefined || change.backend === backend)
+          ) {
+            return
+          }
+          continue
+        }
+
+        const { done, value } = await reader.read()
+        if (done) throw new Error('Skepsis event stream closed')
+        buffer += decoder.decode(value, { stream: true }).replaceAll('\r\n', '\n')
+      }
+      // oxlint-enable no-await-in-loop
+    },
+    close: () => {
+      void reader.cancel().catch(() => {})
+    },
+  }
+}
+
 function printQuestion(question: QuestionClaim, asJson: boolean): void {
   if (asJson) {
     process.stdout.write(JSON.stringify(question) + '\n')
     return
   }
+  const conversation =
+    question.messages.length > 1
+      ? [
+          'conversation:',
+          ...question.messages.flatMap((message) => {
+            const label =
+              message.role === 'user' ? 'user' : `assistant (${message.outcome})`
+            const [first = '', ...rest] = message.content.split('\n')
+            return [`  ${label}: ${first}`, ...rest.map((line) => `    ${line}`)]
+          }),
+          '',
+        ]
+      : []
   process.stdout.write(
     [
       `id: ${question.id}`,
@@ -298,6 +395,7 @@ function printQuestion(question: QuestionClaim, asJson: boolean): void {
       `lease: ${question.leaseId}`,
       `question: ${question.question}`,
       '',
+      ...conversation,
       question.excerpt,
       '',
     ].join('\n'),
@@ -326,6 +424,10 @@ program
   .option('--backend <backend>', 'limit to a specific backend (pi, claude, codex)')
   .option('--worker <name>', 'worker name recorded on the claim', `${process.pid}`)
   .option('--json', 'print the claimed question as JSON')
+  .option(
+    '--wait [seconds]',
+    'wait for a question; optional seconds stop starting new claims',
+  )
   .option('--cwd <path>', 'repository cwd used for server discovery')
   .option('--server <url>', 'explicit Skepsis server URL')
   .option('--token <token>', 'explicit Skepsis server token')
@@ -334,18 +436,73 @@ program
       backend?: string
       worker: string
       json?: boolean
+      wait?: string | boolean
       cwd?: string
       server?: string
       token?: string
     }) => {
+      const wait = parsePollWait(opts.wait)
+      const backend = parseBackend(opts.backend)
       const access = await resolveServerAccess(opts)
-      const res = await apiFetch<QuestionClaimResponse>('/api/questions/claim', {
-        method: 'POST',
-        access,
-        body: { backend: parseBackend(opts.backend), worker: opts.worker },
-      })
-      if (!res.question) return
-      printQuestion(res.question, opts.json ?? false)
+
+      const claim = () =>
+        apiFetch<QuestionClaimResponse>('/api/questions/claim', {
+          method: 'POST',
+          access,
+          body: { backend, worker: opts.worker },
+        })
+
+      if (wait === undefined) {
+        const res = await claim()
+        if (res.question) printQuestion(res.question, opts.json ?? false)
+        return
+      }
+
+      const controller = new AbortController()
+      const deadline = typeof wait === 'number' ? performance.now() + wait : undefined
+      const expired = () => deadline !== undefined && performance.now() >= deadline
+      let timedOut = false
+      const timer =
+        typeof wait === 'number'
+          ? setTimeout(() => {
+              timedOut = true
+              controller.abort()
+            }, wait)
+          : undefined
+      let events: QueueEventStream | undefined
+      try {
+        events = await openQueueEventStream(access, backend, controller.signal)
+        if (expired()) return
+        // One immediate attempt catches work queued before the subscription.
+        let res = await claim()
+        if (res.question) {
+          printQuestion(res.question, opts.json ?? false)
+          return
+        }
+
+        while (true) {
+          if (expired()) return
+          // The single blocking stream read is the idle path. Claims remain
+          // sequential so this invocation can never lease more than one job.
+          // oxlint-disable-next-line no-await-in-loop
+          await events.nextQueued()
+          if (expired()) return
+          // oxlint-disable-next-line no-await-in-loop
+          res = await claim()
+          if (res.question) {
+            printQuestion(res.question, opts.json ?? false)
+            return
+          }
+        }
+      } catch (error) {
+        const expectedTimeout =
+          timedOut && error instanceof Error && error.name === 'AbortError'
+        if (!expectedTimeout) throw error
+      } finally {
+        clearTimeout(timer)
+        controller.abort()
+        events?.close()
+      }
     },
   )
 

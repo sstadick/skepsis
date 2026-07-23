@@ -779,13 +779,147 @@ body,
   background: var(--green-bright);
 }
 
-/* Review comment annotation row */
+/* Source-backed review comments are presented as an inline discussion thread,
+   while their <review> storage rows stay concealed inside the diff shadow DOM. */
 .review-annotation {
-  display: flex;
-  justify-content: flex-end;
-  padding: 4px 12px;
+  padding: 8px 12px 12px;
   background: var(--bg-panel);
   border-top: 1px solid var(--border);
+  font-family:
+    system-ui,
+    -apple-system,
+    sans-serif;
+}
+
+.review-thread {
+  width: 100%;
+  overflow: hidden;
+  color: var(--fg);
+  background: var(--bg-code);
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+}
+
+.review-thread-entry + .review-thread-entry {
+  border-top: 1px solid var(--border);
+}
+
+.review-thread-header {
+  min-height: 34px;
+  padding: 5px 8px 5px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--bg-header);
+}
+
+.review-thread-byline {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.review-thread-kind {
+  color: var(--fg-muted);
+}
+
+.review-thread-backend {
+  color: var(--fg-bright);
+  font-weight: 600;
+}
+
+.review-thread-status {
+  padding: 1px 7px;
+  color: var(--amber);
+  background: color-mix(in oklch, var(--amber) 12%, var(--bg-code));
+  border: 1px solid color-mix(in oklch, var(--amber) 45%, var(--border));
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+}
+
+.review-thread-status-answered {
+  color: var(--green-text);
+  background: color-mix(in oklch, var(--green-text) 10%, var(--bg-code));
+  border-color: color-mix(in oklch, var(--green-text) 40%, var(--border));
+}
+
+.review-thread-status-failed {
+  color: var(--red);
+  background: color-mix(in oklch, var(--red) 10%, var(--bg-code));
+  border-color: color-mix(in oklch, var(--red) 40%, var(--border));
+}
+
+.review-thread-header .btn {
+  padding: 4px 10px;
+  flex: none;
+  font-size: 12px;
+}
+
+.review-thread-body {
+  padding: 11px 12px 12px;
+  color: var(--fg-bright);
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.review-thread-reply .review-thread-header {
+  background: var(--bg-panel);
+}
+
+.review-thread-reply-user .review-thread-header {
+  background: var(--bg-header);
+}
+
+.review-thread-reply-failed .review-thread-kind {
+  color: var(--red);
+}
+
+.review-thread-follow-up {
+  padding: 10px 12px;
+  background: var(--bg-panel);
+}
+
+.review-thread-follow-up textarea {
+  display: block;
+  width: 100%;
+  min-height: 68px;
+  resize: vertical;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  color: var(--fg-bright);
+  background: var(--bg-code);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.review-thread-follow-up textarea:focus {
+  border-color: var(--green);
+  outline: 2px solid color-mix(in oklch, var(--green) 25%, transparent);
+  outline-offset: -1px;
+}
+
+.review-thread-follow-up-actions {
+  min-height: 30px;
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.review-thread-follow-up-actions .comment-form-error {
+  margin-right: auto;
 }
 
 /* Help modal */
