@@ -9,7 +9,12 @@
 import { defineConfig } from 'tsdown'
 
 export default defineConfig({
-  entry: ['cli.ts'],
+  entry: {
+    cli: 'cli.ts',
+    codemodeWorker: 'server/codemodeWorker.ts',
+    reviewCodemode: 'server/reviewCodemode.ts',
+  },
+  copy: [{ from: 'node_modules/quickjs-wasi/quickjs.wasm', to: 'dist' }],
   outDir: 'dist',
   clean: false,
   dts: false,

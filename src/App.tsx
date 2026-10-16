@@ -48,14 +48,13 @@ import type {
   FileHashes,
 } from '../shared/types.ts'
 import {
-  BARE_COMMENT,
-  type CommentSyntax,
-  REVIEW_CLOSE_TAG,
-  type ReviewThreadContent,
-  parseReviewOpenTag,
-  parseReviewThread,
-  reviewTagRegex,
-} from '../shared/reviewComments.ts'
+  LineChat,
+  ReviewPanel,
+  useReview,
+  anchorKey,
+  bufferAnchors,
+} from './ReviewPanel.tsx'
+import type { ReviewAnchor } from '../shared/review.ts'
 
 const queryClient = new QueryClient()
 
@@ -127,72 +126,7 @@ function useToast(duration = 1400) {
   return { toast, showToast }
 }
 
-// --- Review comment types and detection ---
-
-type AnnotationMeta =
-  | {
-      type: 'review'
-      startLine: number
-      endLine: number
-      file: string
-      thread: ReviewThreadContent
-    }
-  | { type: 'composing'; file: string }
-
-/** Walk the addition side of a diff and find <review>...</review> blocks.
- *  Bare-fallback files get bare tags on insert, so detection matches bare tag
- *  lines only in those files — in a normal file a bare tag line is real
- *  content, not a review comment. */
-function detectReviewComments(
-  fileDiff: FileDiffMetadata,
-  fileName: string,
-  syntax: CommentSyntax | null | undefined,
-): DiffLineAnnotation<AnnotationMeta>[] {
-  const storageSyntax = !syntax || syntax.prefix === '' ? BARE_COMMENT : syntax
-  const closePattern = reviewTagRegex(storageSyntax, REVIEW_CLOSE_TAG)
-  const annotations: DiffLineAnnotation<AnnotationMeta>[] = []
-  for (const hunk of fileDiff.hunks) {
-    let openLine: number | null = null
-    let indent = ''
-    let threadId: string | undefined
-    let bodyLines: string[] = []
-    for (let i = 0; i < hunk.additionCount; i++) {
-      const lineText = fileDiff.additionLines[hunk.additionLineIndex + i]
-      if (lineText == null) continue
-      const absLine = hunk.additionStart + i
-      if (openLine === null) {
-        const candidateIndent = lineText.match(/^(\s*)/)?.[1] ?? ''
-        const open = parseReviewOpenTag(lineText, storageSyntax, candidateIndent)
-        if (open) {
-          openLine = absLine
-          indent = candidateIndent
-          threadId = open.threadId
-          bodyLines = []
-          continue
-        }
-      }
-      if (closePattern.test(lineText) && openLine !== null) {
-        annotations.push({
-          side: 'additions',
-          lineNumber: absLine,
-          metadata: {
-            type: 'review',
-            startLine: openLine,
-            endLine: absLine,
-            file: fileName,
-            thread: parseReviewThread(bodyLines, storageSyntax, indent, threadId),
-          },
-        })
-        openLine = null
-        threadId = undefined
-        bodyLines = []
-      } else if (openLine !== null) {
-        bodyLines.push(lineText)
-      }
-    }
-  }
-  return annotations
-}
+type AnnotationMeta = { type: 'durable'; anchor: ReviewAnchor }
 
 // In split mode the diffs library renders pure adds ('new') and pure deletes
 // ('deleted') as a single full-width column. We want them laid out like every
@@ -214,31 +148,6 @@ function getFileStats(fileDiff: FileDiffMetadata) {
   }
   return { additions, deletions }
 }
-
-// --- Review-comment storage-line concealment ---
-
-// Injected into every CodeView item's shadow root via the `unsafeCSS` option.
-// Source-backed <review> rows stay in the diff grid so CodeView can retain its
-// line mappings and, in split mode, @pierre's deletion-side placeholder spans
-// remain aligned with the matching addition rows. The cells keep their geometry
-// but their source representation is hidden; the thread card is their visible
-// presentation. `tagReviewLines` re-applies the marker after each virtualized
-// render/recycle and offsets the card by the hidden tracks' measured height.
-const REVIEW_CSS = `
-  [data-review-comment] {
-    visibility: hidden !important;
-    pointer-events: none !important;
-    user-select: none !important;
-  }
-  /* The comment "+" only works on the additions side (comments are inserted
-     after an addition/context line in the new file). Hide it on the deletions
-     side — the whole left column in split mode, and change-deletion lines in
-     unified mode — so it doesn't appear where clicking is a no-op. */
-  [data-deletions] [data-gutter-utility-slot],
-  [data-line-type='change-deletion'] [data-gutter-utility-slot] {
-    display: none !important;
-  }
-`
 
 // The diffs library's expand chevron sprite (a down chevron), as a mask so we
 // can paint a placeholder copy in the same color.
@@ -269,360 +178,6 @@ const EXPAND_PLACEHOLDER_CSS = `
     mask: ${EXPAND_CHEVRON} center / 16px no-repeat;
   }
 `
-
-/**
- * Tag addition lines within review-block ranges with `data-review-comment` so
- * REVIEW_CSS can conceal the storage representation without removing its grid
- * tracks. `node` is the item's `diffs-container` element; we re-derive tags
- * from scratch each call so recycled (pooled) elements never carry stale
- * markers from another file.
- */
-function tagReviewLines(
-  node: HTMLElement,
-  ranges: Array<{ start: number; end: number }>,
-): void {
-  const sr = node.shadowRoot
-  if (!sr) return
-  const pre = sr.querySelector('pre')
-  if (!pre) return
-
-  for (const el of sr.querySelectorAll('[data-review-comment]')) {
-    el.removeAttribute('data-review-comment')
-  }
-  if (ranges.length === 0) return
-
-  const matchingRange = (n: number) =>
-    ranges.find((range) => n >= range.start && n <= range.end)
-  const renderedHeights = new Map<number, number>()
-
-  for (const col of Array.from(pre.children)) {
-    if (!(col instanceof HTMLElement) || !col.hasAttribute('data-code')) continue
-    if (col.hasAttribute('data-deletions')) continue
-    const gutter = col.querySelector('[data-gutter]')
-    const content = col.querySelector('[data-content]')
-    if (!gutter || !content) continue
-    for (let i = 0; i < gutter.children.length && i < content.children.length; i++) {
-      const g = gutter.children[i] as HTMLElement
-      const c = content.children[i] as HTMLElement
-      if (g.getAttribute('data-line-type') !== 'change-addition') continue
-      const numAttr = g.getAttribute('data-column-number')
-      if (!numAttr) continue
-      const lineNum = parseInt(numAttr, 10)
-      const range = matchingRange(lineNum)
-      if (range) {
-        g.setAttribute('data-review-comment', '')
-        c.setAttribute('data-review-comment', '')
-        renderedHeights.set(
-          range.start,
-          (renderedHeights.get(range.start) ?? 0) +
-            Math.max(g.getBoundingClientRect().height, c.getBoundingClientRect().height),
-        )
-      }
-    }
-  }
-
-  // The storage tracks stay in CodeView so its source-line mapping remains
-  // intact. Pull each visible card upward by their actual rendered height,
-  // including any wrapped source rows, so the tracks do not become blank UI.
-  for (const range of ranges) {
-    const annotation = node.querySelector<HTMLElement>(
-      `[data-review-start="${range.start}"]`,
-    )
-    const height = renderedHeights.get(range.start)
-    if (annotation && height) annotation.style.marginTop = `${-height}px`
-  }
-}
-
-/** Review-block ranges for an item's annotations (used by tagReviewLines). */
-function reviewRanges(
-  annotations: ReadonlyArray<{ metadata?: AnnotationMeta }> | undefined,
-): Array<{ start: number; end: number }> {
-  return (annotations ?? []).flatMap((a) =>
-    a.metadata?.type === 'review'
-      ? [{ start: a.metadata.startLine, end: a.metadata.endLine }]
-      : [],
-  )
-}
-
-type ButtonProps = {
-  variant?: 'primary' | 'secondary'
-  onClick: () => void
-  disabled?: boolean
-  ariaLabel?: string
-  children: React.ReactNode
-}
-
-function Button({
-  variant = 'secondary',
-  onClick,
-  disabled,
-  ariaLabel,
-  children,
-}: ButtonProps) {
-  return (
-    <button
-      type="button"
-      className={`btn btn-${variant}`}
-      onClick={onClick}
-      disabled={disabled}
-      aria-label={ariaLabel}
-    >
-      {children}
-    </button>
-  )
-}
-
-const BACKEND_LABELS = {
-  pi: 'Pi',
-  claude: 'Claude',
-  codex: 'Codex',
-} as const
-
-function reviewThreadKey(
-  file: string,
-  startLine: number,
-  thread: ReviewThreadContent,
-): string {
-  // Managed blocks have a persistent source-backed UUID, so their UI state
-  // survives SSE reparses and line shifts. Legacy blocks fall back to their
-  // anchor, which at least keeps identical questions from sharing a draft.
-  return thread.threadId
-    ? JSON.stringify(['thread', file, thread.threadId])
-    : JSON.stringify(['legacy', file, startLine])
-}
-
-function ReviewThread({
-  thread,
-  onResolve,
-  onFollowUp,
-  followUpDraft,
-  onFollowUpDraftChange,
-  resolving,
-  followingUp,
-  followUpError,
-}: {
-  thread: ReviewThreadContent
-  onResolve: () => void
-  onFollowUp: (text: string) => void
-  followUpDraft: string
-  onFollowUpDraftChange: (text: string) => void
-  resolving: boolean
-  followingUp: boolean
-  followUpError: string | null
-}) {
-  const isQuestion = thread.kind === 'question'
-  const backend = isQuestion ? BACKEND_LABELS[thread.backend] : null
-  const status = isQuestion ? thread.status : null
-  const statusLabel =
-    status === 'answered' ? 'Answered' : status === 'failed' ? 'Failed' : 'Pending'
-  const initialBody = isQuestion ? thread.messages[0]!.content : thread.body
-  const replies = isQuestion ? thread.messages.slice(1) : []
-
-  return (
-    <article
-      className="review-thread"
-      aria-label={isQuestion ? `Review question for ${backend}` : 'Review comment'}
-    >
-      <div className="review-thread-entry">
-        <header className="review-thread-header">
-          <div className="review-thread-byline">
-            {isQuestion ? (
-              <>
-                <span className="review-thread-kind">Question for</span>
-                <span className="review-thread-backend">{backend}</span>
-                <span
-                  className={`review-thread-status review-thread-status-${status}`}
-                  role="status"
-                  aria-live="polite"
-                  aria-atomic="true"
-                >
-                  {statusLabel}
-                </span>
-              </>
-            ) : (
-              <span className="review-thread-kind">Review comment</span>
-            )}
-          </div>
-          <Button
-            onClick={onResolve}
-            disabled={resolving}
-            ariaLabel={
-              isQuestion
-                ? `Resolve review question for ${backend}`
-                : 'Resolve review comment'
-            }
-          >
-            {resolving ? 'Resolving…' : 'Resolve'}
-          </Button>
-        </header>
-        <div className="review-thread-body">{initialBody}</div>
-      </div>
-      {replies.map((message, index) => (
-        <div
-          // Thread messages are append-only, so their source-order position is
-          // stable for the lifetime of the card.
-          // oxlint-disable-next-line react/no-array-index-key
-          key={`${message.role}-${index}`}
-          className={[
-            'review-thread-entry',
-            'review-thread-reply',
-            `review-thread-reply-${message.role}`,
-            message.role === 'assistant' ? `review-thread-reply-${message.outcome}` : '',
-          ]
-            .filter(Boolean)
-            .join(' ')}
-        >
-          <header className="review-thread-header">
-            <div className="review-thread-byline">
-              <span className="review-thread-backend">
-                {message.role === 'assistant' ? backend : 'You'}
-              </span>
-              <span className="review-thread-kind">
-                {message.role === 'assistant' ? message.outcome : 'follow-up'}
-              </span>
-            </div>
-          </header>
-          <div className="review-thread-body">{message.content}</div>
-        </div>
-      ))}
-      {isQuestion && status !== 'pending' && (
-        <ThreadFollowUpForm
-          backend={backend!}
-          text={followUpDraft}
-          onTextChange={onFollowUpDraftChange}
-          onSubmit={onFollowUp}
-          submitting={followingUp}
-          error={followUpError}
-        />
-      )}
-    </article>
-  )
-}
-
-function ThreadFollowUpForm({
-  backend,
-  text,
-  onTextChange,
-  onSubmit,
-  submitting,
-  error,
-}: {
-  backend: string
-  text: string
-  onTextChange: (text: string) => void
-  onSubmit: (text: string) => void
-  submitting: boolean
-  error: string | null
-}) {
-  const submit = () => {
-    const body = text.trim()
-    if (!body || submitting) return
-    onSubmit(body)
-  }
-
-  return (
-    <div
-      className="review-thread-entry review-thread-follow-up"
-      onClick={(event) => event.stopPropagation()}
-    >
-      <textarea
-        value={text}
-        onChange={(event) => onTextChange(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-            event.preventDefault()
-            submit()
-          }
-        }}
-        placeholder={`Follow up with ${backend}… (Cmd+Enter to send)`}
-        rows={3}
-        disabled={submitting}
-        aria-label={`Follow up with ${backend}`}
-      />
-      <div className="review-thread-follow-up-actions">
-        {error && <div className="comment-form-error">{error}</div>}
-        <Button variant="primary" disabled={!text.trim() || submitting} onClick={submit}>
-          {submitting ? 'Sending…' : 'Send follow-up'}
-        </Button>
-      </div>
-    </div>
-  )
-}
-
-// --- Comment form ---
-
-function CommentForm({
-  onSubmit,
-  onCancel,
-  submitting,
-  error,
-  syntax,
-}: {
-  onSubmit: (text: string) => void
-  onCancel: () => void
-  submitting: boolean
-  error: string | null
-  /** Comment syntax the inserted tags will use. Empty prefix: the format has
-   *  no comment syntax; null: unrecognized file type. Both insert bare. */
-  syntax: CommentSyntax | null
-}) {
-  const [text, setText] = useState('')
-  // useEffect instead of a function ref because the function ref didn't
-  // actually focus the textarea on open.
-  const ref = useRef<HTMLTextAreaElement>(null)
-  useEffect(() => {
-    ref.current?.focus()
-  }, [])
-
-  const submit = () => {
-    const body = text.trim()
-    if (!body || submitting) return
-    onSubmit(body)
-  }
-
-  return (
-    <div className="comment-form" onClick={(e) => e.stopPropagation()}>
-      <textarea
-        ref={ref}
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-            e.preventDefault()
-            submit()
-          }
-          if (e.key === 'Escape') onCancel()
-        }}
-        placeholder="Leave a review comment... (Cmd+Enter to submit)"
-        rows={3}
-        disabled={submitting}
-      />
-      <div className="comment-form-actions">
-        <div className="comment-form-note">
-          {syntax === null ? (
-            <>Comment marker: none (file type not recognized)</>
-          ) : syntax.prefix === '' ? (
-            <>Comment marker: none (plain text)</>
-          ) : (
-            <>
-              Comment marker:{' '}
-              <code>
-                {syntax.suffix ? `${syntax.prefix} ${syntax.suffix}` : syntax.prefix}
-              </code>
-            </>
-          )}
-        </div>
-        {error && <div className="comment-form-error">{error}</div>}
-        <Button onClick={onCancel} disabled={submitting}>
-          Cancel
-        </Button>
-        <Button variant="primary" disabled={!text.trim() || submitting} onClick={submit}>
-          Comment
-        </Button>
-      </div>
-    </div>
-  )
-}
 
 /* Tooltip for the header buttons, portaled to document.body so it paints over
    the diff bodies — a CSS ::after tooltip on the buttons is trapped one
@@ -970,67 +525,6 @@ function HelpModal({ onClose }: { onClose: () => void }) {
   )
 }
 
-function CommentsModal({ onClose, vcs }: { onClose: () => void; vcs: 'jj' | 'git' }) {
-  return (
-    <Modal onClose={onClose}>
-      <p>
-        Comments work by inserting lines into the code. This can only work if the{' '}
-        {vcs === 'jj' ? (
-          <>
-            revset includes <code>@</code>
-          </>
-        ) : (
-          'commit range includes the working copy'
-        )}
-        . Otherwise, the inserted lines will land in{' '}
-        {vcs === 'jj' ? <code>@</code> : 'the working copy'} but not in the diff being
-        viewed.
-      </p>
-      {vcs === 'jj' ? (
-        <p>
-          The easiest way to get a diff with comments enabled is to run with the{' '}
-          <code>-f</code> flag to get a diff that starts at some revision and ends at{' '}
-          <code>@</code>.
-        </p>
-      ) : (
-        <p>
-          The easiest way to get a diff with comments enabled is to run with <code>-f</code>{' '}
-          only (no <code>-t</code>), so the diff goes from a commit to the working tree.
-        </p>
-      )}
-    </Modal>
-  )
-}
-
-function CommentsDisabledBanner({
-  onLearnMore,
-  vcs,
-}: {
-  onLearnMore: () => void
-  vcs: 'jj' | 'git'
-}) {
-  return (
-    <div className="comments-disabled-banner">
-      {vcs === 'jj' ? (
-        <>
-          Comments are disabled because the revset does not include <code>@</code>.
-        </>
-      ) : (
-        'Comments are disabled because the commit range does not end at the working copy.'
-      )}{' '}
-      <a
-        href="#"
-        onClick={(e) => {
-          e.preventDefault()
-          onLearnMore()
-        }}
-      >
-        Learn more
-      </a>
-    </div>
-  )
-}
-
 type SplitMode = 'responsive' | 'unified'
 const SPLIT_CYCLE: SplitMode[] = ['responsive', 'unified']
 
@@ -1062,18 +556,41 @@ function DiffView() {
   // Files the user expanded via the header's expand-all-lines button: these are
   // re-parsed with whole-file context so every collapsed region is revealed.
   const [expandedFiles, setExpandedFiles] = useState<Record<string, boolean>>({})
+  const review = useReview()
   const [composing, setComposing] = useState<{
     file: string
     line: number
+    side: 'LEFT' | 'RIGHT'
+    revision: string
   } | null>(null)
-  // CodeView virtualizes annotations, so card-local state would disappear on
-  // scroll or an SSE refresh. The initial question is stable across line shifts.
-  const [followUpDrafts, setFollowUpDrafts] = useState<Record<string, string>>({})
+  const composingHadBuffer = useRef<string | null>(null)
+  useEffect(() => {
+    if (!composing) {
+      composingHadBuffer.current = null
+      return
+    }
+    const key = anchorKey({
+      path: composing.file,
+      line: composing.line,
+      side: composing.side,
+      revision: composing.revision,
+    })
+    if (review.text[key] !== undefined) composingHadBuffer.current = key
+    else if (composingHadBuffer.current === key) {
+      composingHadBuffer.current = null
+      setComposing(null)
+    }
+  }, [composing, review.text])
   const seededFromInitialLoad = useRef(false)
   const { data, error, isLoading } = useQuery({
     queryKey: ['diff'],
     queryFn: () => apiFetch<DiffResponse>('/api/diff'),
   })
+
+  useEffect(() => {
+    if (composing && data?.reviewRevision && composing.revision !== data.reviewRevision)
+      setComposing(null)
+  }, [composing, data?.reviewRevision])
 
   useEffect(() => {
     if (data?.revset) document.title = `skepsis | ${data.revset}`
@@ -1094,9 +611,9 @@ function DiffView() {
 
   const qc = useQueryClient()
 
-  // Agent answers arrive outside the browser's mutation lifecycle. The server
-  // emits a named event after a source-backed review changes; native
-  // EventSource reconnection handles transient server/browser disconnects.
+  // Agent answers arrive outside the browser's mutation lifecycle. Named
+  // server events refresh review and diff state; native EventSource
+  // reconnection handles transient server/browser disconnects.
   useEffect(() => {
     const events = new EventSource('/api/events')
     const refreshDiff = () => {
@@ -1105,10 +622,19 @@ function DiffView() {
     // The stream deliberately has no replay buffer. Refreshing on every open
     // closes the gap between the last diff response and initial connect (and
     // catches anything missed while a reconnect was in flight).
-    events.addEventListener('open', refreshDiff)
+    const refreshReview = () => {
+      void qc.invalidateQueries({ queryKey: ['review'] })
+    }
+    const reconnect = () => {
+      refreshDiff()
+      refreshReview()
+    }
+    events.addEventListener('thread-changed', refreshReview)
+    events.addEventListener('open', reconnect)
     events.addEventListener('review-changed', refreshDiff)
     return () => {
-      events.removeEventListener('open', refreshDiff)
+      events.removeEventListener('open', reconnect)
+      events.removeEventListener('thread-changed', refreshReview)
       events.removeEventListener('review-changed', refreshDiff)
       events.close()
     }
@@ -1164,76 +690,6 @@ function DiffView() {
     onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
   })
 
-  const commentMutation = useMutation({
-    mutationFn: ({
-      file,
-      afterLine,
-      text,
-    }: {
-      file: string
-      afterLine: number
-      text: string
-    }) =>
-      apiFetch('/api/comment', {
-        method: 'POST',
-        body: { file, afterLine, text },
-      }),
-    onSuccess: () => setComposing(null),
-    onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
-  })
-
-  const followUpMutation = useMutation({
-    mutationFn: ({
-      file,
-      line,
-      text,
-      threadId,
-    }: {
-      file: string
-      line: number
-      text: string
-      draftKey: string
-      threadId?: string
-    }) =>
-      apiFetch('/api/comment/follow-up', {
-        method: 'POST',
-        body: { file, line, text, threadId },
-      }),
-    onSuccess: (_data, variables) => {
-      setFollowUpDrafts((previous) => {
-        const next = { ...previous }
-        delete next[variables.draftKey]
-        return next
-      })
-    },
-    onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
-  })
-
-  const resolveMutation = useMutation({
-    mutationFn: ({
-      file,
-      line,
-      threadId,
-    }: {
-      file: string
-      line: number
-      draftKey: string
-      threadId?: string
-    }) =>
-      apiFetch('/api/comment', {
-        method: 'DELETE',
-        body: { file, line, threadId },
-      }),
-    onSuccess: (_data, variables) => {
-      setFollowUpDrafts((previous) => {
-        const next = { ...previous }
-        delete next[variables.draftKey]
-        return next
-      })
-    },
-    onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
-  })
-
   // Memoize patch parsing so it doesn't re-run on viewed state changes. These
   // are "partial" diffs (no full-file context), used for initial paint and as
   // the fallback when full contents aren't available.
@@ -1274,7 +730,7 @@ function DiffView() {
       const params = new URLSearchParams({ path: f.name })
       if (f.prevName) params.set('oldPath', f.prevName)
       return {
-        queryKey: ['file-contents', f.name, hash] as const,
+        queryKey: ['file-contents', f.name, hash, data?.reviewRevision] as const,
         queryFn: () => apiFetch<FileContentsResponse>(`/api/file-contents?${params}`),
         enabled:
           expandable &&
@@ -1340,44 +796,25 @@ function DiffView() {
     })
   }, [patchFiles, contentsByFile, expandedFiles])
 
-  const commentsEnabled = data?.commentsEnabled ?? false
-  const commentSyntaxes = data?.commentSyntaxes
-
-  // Detect source-backed review blocks once and share the exact ranges between
-  // annotation rendering and keyboard navigation. Keeping one source of truth
-  // prevents j/k from landing on rows whose storage representation is hidden.
-  const reviewAnnotationsByFile = useMemo(() => {
-    const map = new Map<string, DiffLineAnnotation<AnnotationMeta>[]>()
-    if (!commentsEnabled || !commentSyntaxes) return map
-    for (const fileDiff of files) {
-      map.set(
-        fileDiff.name,
-        detectReviewComments(fileDiff, fileDiff.name, commentSyntaxes[fileDiff.name]),
-      )
-    }
-    return map
-  }, [files, commentsEnabled, commentSyntaxes])
+  const commentsEnabled = !!review.data && !!data?.reviewRevision
 
   // Navigable lines per file for the j/k cursor: addition-side line numbers
-  // (context + additions; deletions and concealed review storage are skipped),
+  // (context + additions; deletions are skipped),
   // derived from hunk metadata rather than the DOM.
   const fileLines = useMemo(() => {
     const map = new Map<string, number[]>()
     for (const f of files) {
       const lines: number[] = []
-      const ranges = reviewRanges(reviewAnnotationsByFile.get(f.name))
       for (const h of f.hunks) {
         for (let i = 0; i < h.additionCount; i++) {
           const line = h.additionStart + i
-          if (!ranges.some((range) => line >= range.start && line <= range.end)) {
-            lines.push(line)
-          }
+          lines.push(line)
         }
       }
       map.set(f.name, lines)
     }
     return map
-  }, [files, reviewAnnotationsByFile])
+  }, [files])
 
   // j/k line cursor: a (file, line) position on the additions side. Rendered
   // through CodeView's native line selection (see effect below) so cursor
@@ -1407,7 +844,6 @@ function DiffView() {
   ])
 
   const [showHelp, setShowHelp] = useState(false)
-  const [showCommentsInfo, setShowCommentsInfo] = useState(false)
   const codeViewRef = useRef<CodeViewHandle<AnnotationMeta>>(null)
   // Latest scroll offset, tracked for file navigation (n/p). Kept in a ref so
   // scrolling doesn't trigger re-renders; the key handler reads it on demand.
@@ -1457,9 +893,8 @@ function DiffView() {
 
   // Build the CodeView item list. CodeView only re-renders an item when its
   // `version` changes, so we bump version whenever any rendered input for a
-  // file changes: its content hash (which also covers review annotations,
-  // since those are derived from diff content), the composing-form line, or
-  // its collapsed state. diffStyle is deliberately not in the key: an
+  // file changes: its content hash, durable review state, composing anchor,
+  // or collapsed state. diffStyle is deliberately not in the key: an
   // `options` change makes the library re-render every item on its own.
   //
   // The map is mutated during render, which is safe here: writes are
@@ -1472,14 +907,32 @@ function DiffView() {
     const { fileHashes } = data
     return files.map((fileDiff) => {
       const name = fileDiff.name
-      const annotations = [...(reviewAnnotationsByFile.get(name) ?? [])]
-      if (composing?.file === name) {
-        annotations.push({
-          side: 'additions',
-          lineNumber: composing.line,
-          metadata: { type: 'composing', file: name },
-        })
+      const grouped = new Map<string, ReviewAnchor>()
+      for (const entry of [
+        ...(review.data?.threads ?? []),
+        ...(review.data?.drafts ?? []),
+        ...bufferAnchors(review.text).map((anchor) => ({ anchor })),
+      ]) {
+        const a = entry.anchor
+        if (a.path === name && a.revision === data?.reviewRevision)
+          grouped.set(anchorKey(a), a)
       }
+      if (composing?.file === name && composing.revision === data?.reviewRevision) {
+        const a: ReviewAnchor = {
+          path: name,
+          line: composing.line,
+          side: composing.side,
+          revision: composing.revision,
+        }
+        grouped.set(anchorKey(a), a)
+      }
+      const annotations: DiffLineAnnotation<AnnotationMeta>[] = [...grouped.values()].map(
+        (anchor) => ({
+          side: anchor.side === 'LEFT' ? 'deletions' : 'additions',
+          lineNumber: anchor.line,
+          metadata: { type: 'durable', anchor },
+        }),
+      )
       const isCollapsed = collapsed[name] ?? false
       const isExpanded = expandedFiles[name] ?? false
       const composingLine = composing?.file === name ? composing.line : -1
@@ -1487,7 +940,7 @@ function DiffView() {
       // item to an expandable diff — bump the version so CodeView re-renders it.
       // isExpanded is in the key too: expand-all swaps fileDiff for a re-parse
       // at the same content hash, so nothing else here would move the version.
-      const key = `${fileHashes[name] ?? ''}|${composingLine}|${isCollapsed ? 1 : 0}|${fileDiff.isPartial ? 1 : 0}|${isExpanded ? 1 : 0}`
+      const key = `${fileHashes[name] ?? ''}|${composingLine}|${composing?.side}|${JSON.stringify(annotations)}|${JSON.stringify(review.data?.threads.filter((t) => t.anchor.path === name))}|${JSON.stringify(review.data?.drafts.filter((d) => d.anchor.path === name))}|${isCollapsed ? 1 : 0}|${fileDiff.isPartial ? 1 : 0}|${isExpanded ? 1 : 0}`
       const prev = versionsRef.current.get(name)
       const version = !prev || prev.key !== key ? (prev?.version ?? 0) + 1 : prev.version
       if (!prev || prev.key !== key) versionsRef.current.set(name, { key, version })
@@ -1500,7 +953,7 @@ function DiffView() {
         version,
       }
     })
-  }, [files, data, composing, collapsed, expandedFiles, reviewAnnotationsByFile])
+  }, [files, data, composing, collapsed, expandedFiles, review.data, review.text])
   itemsRef.current = items
 
   // The header highlight falls back to the first file before any focus exists
@@ -1619,96 +1072,24 @@ function DiffView() {
   )
 
   const renderAnnotation = useCallback(
-    (
-      annotation: LineAnnotation<AnnotationMeta> | DiffLineAnnotation<AnnotationMeta>,
-      item: CodeViewItem<AnnotationMeta>,
-    ) => {
+    (annotation: LineAnnotation<AnnotationMeta> | DiffLineAnnotation<AnnotationMeta>) => {
       const meta = annotation.metadata
       if (!meta) return null
-      const file = item.id
-      if (meta.type === 'review') {
-        const draftKey = reviewThreadKey(file, meta.startLine, meta.thread)
-        return (
-          <div
-            className="review-annotation"
-            data-review-start={meta.startLine}
-            // The source-backed rows remain in CodeView for line mapping, but
-            // their 20px tracks are invisible. Pull the visible card over
-            // those tracks so a long thread does not create a blank region.
-            style={{
-              marginTop: `-${(meta.endLine - meta.startLine + 1) * 20}px`,
-            }}
-          >
-            <ReviewThread
-              thread={meta.thread}
-              onResolve={() =>
-                resolveMutation.mutate({
-                  file,
-                  line: meta.startLine,
-                  draftKey,
-                  threadId: meta.thread.threadId,
-                })
-              }
-              onFollowUp={(text) =>
-                followUpMutation.mutate({
-                  file,
-                  line: meta.startLine,
-                  text,
-                  draftKey,
-                  threadId: meta.thread.threadId,
-                })
-              }
-              followUpDraft={followUpDrafts[draftKey] ?? ''}
-              onFollowUpDraftChange={(text) =>
-                setFollowUpDrafts((previous) => ({
-                  ...previous,
-                  [draftKey]: text,
-                }))
-              }
-              resolving={
-                resolveMutation.isPending &&
-                resolveMutation.variables?.draftKey === draftKey
-              }
-              followingUp={
-                followUpMutation.isPending &&
-                followUpMutation.variables?.draftKey === draftKey
-              }
-              followUpError={
-                followUpMutation.isError &&
-                followUpMutation.variables?.draftKey === draftKey
-                  ? followUpMutation.error.message
-                  : null
-              }
-            />
-          </div>
-        )
-      }
-      if (meta.type === 'composing') {
-        return (
-          <CommentForm
-            onSubmit={(text) =>
-              commentMutation.mutate({
-                file,
-                afterLine: annotation.lineNumber,
-                text,
-              })
-            }
-            onCancel={() => setComposing(null)}
-            submitting={
-              commentMutation.isPending && commentMutation.variables?.file === file
-            }
-            error={
-              commentMutation.variables?.file === file && commentMutation.error
-                ? commentMutation.error.message
-                : null
-            }
-            syntax={data?.commentSyntaxes[file] ?? null}
-          />
-        )
-      }
-      return null
+      return (
+        <LineChat
+          anchor={meta.anchor}
+          review={review}
+          composing={
+            composing?.file === meta.anchor.path &&
+            composing.line === meta.anchor.line &&
+            composing.side === meta.anchor.side &&
+            composing.revision === meta.anchor.revision
+          }
+          onClose={() => setComposing(null)}
+        />
+      )
     },
-    [resolveMutation, followUpMutation, followUpDrafts, commentMutation, data],
+    [review, composing],
   )
 
   // Gutter-utility click (start a comment). Routed through a ref so the
@@ -1717,17 +1098,19 @@ function DiffView() {
     (range: SelectedLineRange, item: CodeViewItem<AnnotationMeta>) => void
   >(() => {})
   gutterClickRef.current = (range, item) => {
-    if (!commentsEnabled || range.side !== 'additions') return
-    // Block nesting: disallow starting a comment inside an existing review block.
-    const insideReview = (item.annotations ?? []).some(
-      (a) =>
-        a.metadata?.type === 'review' &&
-        range.start >= a.metadata.startLine &&
-        range.start <= a.metadata.endLine,
-    )
-    if (insideReview) return
-    commentMutation.reset()
-    setComposing({ file: item.id, line: range.start })
+    if (!review.data || !data?.reviewRevision) return
+    review.focusComposer.current = anchorKey({
+      path: item.id,
+      line: range.start,
+      side: range.side === 'deletions' ? 'LEFT' : 'RIGHT',
+      revision: data.reviewRevision,
+    })
+    setComposing({
+      file: item.id,
+      line: range.start,
+      side: range.side === 'deletions' ? 'LEFT' : 'RIGHT',
+      revision: data.reviewRevision,
+    })
   }
 
   const options = useMemo<CodeViewOptions<AnnotationMeta>>(
@@ -1759,11 +1142,8 @@ function DiffView() {
       // entirely, so the slot never exists and the portal has nowhere to land.
       stickyHeaders: true,
       enableGutterUtility: commentsEnabled,
-      unsafeCSS: REVIEW_CSS + EXPAND_PLACEHOLDER_CSS,
+      unsafeCSS: EXPAND_PLACEHOLDER_CSS,
       onGutterUtilityClick: (range, context) => gutterClickRef.current(range, context.item),
-      // Re-tag review-comment lines whenever an item (re)renders. Runs per item
-      // and re-derives tags from scratch, so pooled/recycled elements never keep
-      // stale highlights from a previously-rendered file.
       onPostRender: (node, instance, phase, context) => {
         if (phase === 'unmount') return
         // Mark the file seen so its full contents get fetched for expansion.
@@ -1773,7 +1153,7 @@ function DiffView() {
         if (context.item.type === 'diff') {
           node.toggleAttribute('data-skepsis-partial', context.item.fileDiff.isPartial)
         }
-        tagReviewLines(node, reviewRanges(context.item.annotations))
+
         // Re-apply the cursor selection: a re-rendered (version-bumped) or
         // pooled element loses its selection styling, and the library's own
         // re-sync short-circuits when the range is unchanged — so force it by
@@ -1852,7 +1232,17 @@ function DiffView() {
     }
 
     function handler(e: KeyboardEvent) {
-      if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement)
+      if (
+        e
+          .composedPath()
+          .some(
+            (target) =>
+              target instanceof HTMLTextAreaElement ||
+              target instanceof HTMLInputElement ||
+              target instanceof HTMLSelectElement ||
+              (target instanceof HTMLElement && target.isContentEditable),
+          )
+      )
         return
       if (e.ctrlKey || e.metaKey || e.altKey) return
 
@@ -1920,21 +1310,22 @@ function DiffView() {
           break
         }
         case 'c': {
-          if (!commentsEnabled || showHelp || composing) break
+          if (!review.data || !data?.reviewRevision || showHelp || composing) break
           e.preventDefault()
           const cur = cursorRef.current
           if (!cur || (collapsed[cur.file] ?? false)) break
-          // Same guard as gutter clicks: no comments inside an existing review block.
-          const item = items.find((i) => i.id === cur.file)
-          const insideReview = (item?.annotations ?? []).some(
-            (a) =>
-              a.metadata?.type === 'review' &&
-              cur.line >= a.metadata.startLine &&
-              cur.line <= a.metadata.endLine,
-          )
-          if (insideReview) break
-          commentMutation.reset()
-          setComposing({ file: cur.file, line: cur.line })
+          review.focusComposer.current = anchorKey({
+            path: cur.file,
+            line: cur.line,
+            side: 'RIGHT',
+            revision: data.reviewRevision,
+          })
+          setComposing({
+            file: cur.file,
+            line: cur.line,
+            side: 'RIGHT',
+            revision: data.reviewRevision,
+          })
           break
         }
         case 'e': {
@@ -1967,6 +1358,17 @@ function DiffView() {
             setShowHelp(false)
           } else if (composing) {
             e.preventDefault()
+            const key = anchorKey({
+              path: composing.file,
+              side: composing.side,
+              line: composing.line,
+              revision: composing.revision,
+            })
+            review.setText((prev) => {
+              const next = { ...prev }
+              delete next[key]
+              return next
+            })
             setComposing(null)
           }
           break
@@ -2021,8 +1423,7 @@ function DiffView() {
     markMutation,
     anchorIfTopFile,
     fileLines,
-    commentsEnabled,
-    commentMutation,
+    review,
     setFocused,
     markProgrammaticScroll,
     cycleTheme,
@@ -2035,21 +1436,18 @@ function DiffView() {
   if (data.error) return <pre style={{ color: 'red', padding: 20 }}>{data.error}</pre>
   if (!patch)
     return (
-      <div className="empty-diff">
-        <code>{data.revset}</code> is empty
-      </div>
+      <>
+        <ReviewPanel review={review} />
+        <div className="empty-diff">
+          <code>{data.revset}</code> is empty
+        </div>
+      </>
     )
 
   const { fileHashes } = data
 
   return (
     <>
-      {!data.commentsEnabled && (
-        <CommentsDisabledBanner
-          vcs={data.vcs}
-          onLearnMore={() => setShowCommentsInfo(true)}
-        />
-      )}
       <div className="diff-container">
         {/* Wrapper is the positioning context for the toast, which floats
             centered over the header bar without participating in its flex row
@@ -2079,10 +1477,8 @@ function DiffView() {
             </div>
           )}
         </div>
+        <ReviewPanel review={review} />
         {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
-        {showCommentsInfo && (
-          <CommentsModal vcs={data.vcs} onClose={() => setShowCommentsInfo(false)} />
-        )}
         <CodeView
           ref={codeViewRef}
           className="codeview-root"

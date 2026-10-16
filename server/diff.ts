@@ -12,9 +12,10 @@ import type { DiffArgs, FileHashes } from '../shared/types.ts'
 function run(
   cmd: string,
   args: string[],
+  cwd?: string,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(cmd, args)
+    const proc = spawn(cmd, args, { cwd })
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
     proc.stdout.on('data', (d) => stdout.push(d))
@@ -61,16 +62,24 @@ export function diffCommand(src: DiffArgs): { cmd: string; args: string[] } {
   } else {
     return {
       cmd: 'git',
-      args: [...GIT_PREFIX_OVERRIDE, 'diff', ...src.args, ...fileArgs],
+      args: [
+        ...GIT_PREFIX_OVERRIDE,
+        'diff',
+        '--no-ext-diff',
+        '--no-textconv',
+        ...src.args,
+        ...fileArgs,
+      ],
     }
   }
 }
 
 export async function getDiff(
   src: DiffArgs,
+  cwd?: string,
 ): Promise<{ patch: string; fileHashes: FileHashes }> {
   const { cmd, args } = diffCommand(src)
-  const { stdout, stderr, code } = await run(cmd, args)
+  const { stdout, stderr, code } = await run(cmd, args, cwd)
   if (code !== 0) {
     throw new Error(`${cmd} diff failed (exit ${code}): ${stderr}`)
   }

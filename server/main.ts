@@ -11,9 +11,10 @@ import { streamSSE } from 'hono/streaming'
 import { serve } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { zValidator } from '@hono/zod-validator'
-import { join, relative } from 'node:path'
+import { join } from 'node:path'
 import { readFile } from 'node:fs/promises'
 import type { DiffArgs } from '../shared/types.ts'
+import type { ReviewOptions } from './reviewApi.ts'
 import { getDiff } from './diff.ts'
 import { displayCommand } from './displayCommand.ts'
 import { getFileContents } from './fileContents.ts'
@@ -69,7 +70,8 @@ type ReviewChange =
 
 interface PublishedReviewChange {
   id: string
-  data: ReviewChange
+  event?: 'thread-changed'
+  data: ReviewChange | { reason: 'thread-changed' }
 }
 
 const EVENT_HEARTBEAT_MS = 15_000
@@ -79,11 +81,12 @@ export async function startServer(opts: {
   port?: number
   hostname?: string
   cwd: string
-}): Promise<{ port: number; close: () => void }> {
+  review?: ReviewOptions
+}): Promise<{ port: number; close: () => Promise<void> }> {
   const { diffSource, port = 0, hostname = 'localhost', cwd } = opts
   // Fail fast on bad args by running the exact diff command we'll serve.
   // Result is discarded: /api/diff re-runs it per request to stay fresh.
-  await getDiff(diffSource)
+  await getDiff(diffSource, cwd)
 
   const app = new Hono()
   const questions = new QuestionStore()
@@ -91,6 +94,25 @@ export async function startServer(opts: {
   const reviewChangeListeners = new Set<(event: PublishedReviewChange) => void>()
   let reviewChangeId = 0
   let reviewMutationTail: Promise<void> = Promise.resolve()
+  let origin = `http://${hostname}:${port}`
+  const durable = opts.review
+    ? await (
+        await import('./reviewApi.ts')
+      ).mountReviewApi(app, {
+        cwd,
+        diffSource,
+        review: opts.review,
+        getOrigin: () => origin,
+        publish: () => {
+          const event: PublishedReviewChange = {
+            id: String(++reviewChangeId),
+            event: 'thread-changed',
+            data: { reason: 'thread-changed' },
+          }
+          for (const listener of reviewChangeListeners) listener(event)
+        },
+      })
+    : undefined
 
   function unauthorized(auth: string | undefined): ErrorResponse | null {
     return auth === `Bearer ${serverToken}` ? null : { error: 'Unauthorized' }
@@ -163,7 +185,7 @@ export async function startServer(opts: {
           const event = pending.shift()
           if (event) {
             await stream.writeSSE({
-              event: 'review-changed',
+              event: event.event ?? 'review-changed',
               id: event.id,
               data: JSON.stringify(event.data),
             })
@@ -195,7 +217,7 @@ export async function startServer(opts: {
   })
 
   app.get('/api/diff', async (c) => {
-    const { patch, fileHashes } = await getDiff(diffSource)
+    const { patch, fileHashes } = await getDiff(diffSource, cwd)
     const viewed = await loadViewed(cwd, fileHashes)
     const commentSyntaxes = diffSource.commentsEnabled
       ? await getCommentSyntaxes(cwd, Object.keys(fileHashes))
@@ -492,9 +514,9 @@ export async function startServer(opts: {
   // (`dist/cli.js`): both are one directory below the package root.
   const distDir = join(import.meta.dirname, '..', 'dist', 'web')
 
-  // @hono/node-server resolves `root` relative to cwd. On Windows, this cannot
-  // cross drive letters; installed-package use is expected on Unix-like hosts.
-  app.use('*', serveStatic({ root: relative(cwd, distDir) }))
+  // PR checkouts need not share the launcher's cwd. Serve assets from the
+  // package itself, independently of the repository being reviewed.
+  app.use('*', serveStatic({ root: distDir }))
 
   // SPA fallback
   app.get('*', async (c) => {
@@ -511,19 +533,28 @@ export async function startServer(opts: {
       try {
         const assignedPort = typeof info === 'string' ? port : info.port
         const url = `http://${hostname}:${assignedPort}`
+        origin = url
         await writeServerInfo(cwd, { url, token: serverToken })
         console.info(`skepsis on ${url} (${displayCommand(diffSource)})`)
         resolve({
           port: assignedPort,
-          close: () => {
-            void clearServerInfo(cwd, { url, token: serverToken })
+          close: async () => {
             server.close()
+            if ('closeAllConnections' in server) server.closeAllConnections()
+            await reviewMutationTail
+            await durable?.close()
+            await clearServerInfo(cwd, { url, token: serverToken })
           },
         })
       } catch (error) {
         server.close()
+        await durable?.close()
         reject(error)
       }
+    })
+    server.on('error', (error) => {
+      void durable?.close()
+      reject(error)
     })
   })
 }

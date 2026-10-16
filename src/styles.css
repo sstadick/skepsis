@@ -102,6 +102,90 @@
     Consolas, 'Liberation Mono', monospace;
 }
 
+.durable-review-panel,
+.durable-line-chat {
+  background: var(--bg-panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  font: 13px/1.5 var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.durable-review-panel {
+  flex-shrink: 0;
+  max-height: 60vh;
+  overflow: auto;
+}
+
+.durable-line-chat {
+  margin: 8px;
+  min-width: 0;
+}
+
+.durable-line-chat article {
+  border-top: 1px solid var(--border-soft);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.durable-review-panel textarea,
+.durable-line-chat textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 80px;
+  resize: vertical;
+  margin: 8px 0;
+  padding: 8px;
+  background: var(--bg-code);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  font: inherit;
+}
+
+.durable-review-panel button,
+.durable-review-panel select,
+.durable-line-chat button,
+.durable-line-chat select {
+  background: var(--bg-control);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 5px 9px;
+  font: inherit;
+}
+
+.durable-review-panel button:disabled,
+.durable-line-chat button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.durable-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.review-prose {
+  white-space: pre-wrap;
+}
+.draft-selection {
+  display: block;
+  margin: 8px 0;
+}
+.durable-review-panel summary {
+  cursor: pointer;
+}
+.durable-review-panel [role='alert'],
+.durable-line-chat [role='alert'] {
+  color: var(--red);
+}
+
 /* Forced themes. The attribute arrives two ways: set by the /api/theme.js
    boot script before first paint, and set/removed by the theme toggle at
    runtime. */

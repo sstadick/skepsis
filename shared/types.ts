@@ -122,6 +122,8 @@ export type ViewedMap = Record<string, string>
 export type FileHashes = Record<string, string>
 
 export interface DiffResponse {
+  /** Identity of this exact patch and its resolved review endpoints. */
+  reviewRevision?: string
   patch: string
   revset: string
   vcs: 'jj' | 'git'

@@ -1,9 +1,10 @@
 # skepsis
 
 Local diff review UI: a CLI starts an HTTP server that serves a web app for
-reviewing a jj/git diff in the browser, GitHub-PR-style (per-file viewed
-state, keyboard navigation, review comments written into the working copy as
-comment lines).
+reviewing a GitHub PR or jj/git diff in the browser (per-file viewed state,
+keyboard navigation, private Pi Durable line conversations, and editable
+review drafts explicitly published to GitHub). The normal UI never writes
+comments into source files.
 
 After changes, run `npm run ci` unless narrowing is clearly justified. That
 runs the build, type-check, oxlint, oxfmt check, and tests. Use `npm run fmt`
@@ -57,7 +58,26 @@ src/
                       colors.
 ```
 
-Review comments only work when the diff ends at the working copy (`-f`
-without `-t`), because they're inserted as real lines into files on disk —
-testing comment submit against a real repo writes `<review>` lines into its
-files.
+The normal flow uses `shared/review.ts`, `server/reviewApi.ts`,
+`server/reviewContext.ts` (read-only bounded tools and revision anchors),
+`server/reviewStore.ts` (Pi Durable SQLite), `server/reviewAgent.ts`
+(model/auth), `server/github.ts` (PR checkout/publication), and
+`src/ReviewPanel.tsx`. `server/reviewCodemode.ts` adds the bounded QuickJS worker
+sandbox, and `server/reviewClassifier.ts` loads explicit System One endpoint
+configuration (`--classifier-config` / `SKEPSIS_CLASSIFIER_CONFIG`). Classifier
+credentials remain in server-side closures; never put them in model catalog
+metadata. Use a localhost HTTP stub for classifier tests, never the user's real
+endpoint. The build ships `codemodeWorker.js` and `quickjs.wasm` alongside the CLI;
+exercise both outside `node_modules` when changing packaging.
+
+The original source-backed comment and external queue
+modules remain legacy only. Never use a real GitHub publication as a test.
+Use the faux provider and temp repositories for agent tests; never spend model
+tokens or mutate user repositories just to test chat. Publication is an explicit
+human action; private conversation is never included in its payload.
+
+Pi Durable's experimental dependencies are pinned together. Node >=22.19 is
+required. Model work is paused with --no-agent. PR reviews must be on loopback;
+the browser gets a per-server token for mutating review endpoints. The published
+package still has no production dependencies: smoke-test bundled provider/OAuth
+imports when changing the build.
