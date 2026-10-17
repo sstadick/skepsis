@@ -6,27 +6,17 @@
  * Copyright Oxide Computer Company
  */
 
-import { spawn } from 'node:child_process'
-import { createServer } from 'node:http'
-import type { IncomingHttpHeaders, Server, ServerResponse } from 'node:http'
+import { spawn, execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import type { QuestionClaim, QuestionClaimResponse } from './shared/types.ts'
+import { runServe, stopChild } from './cli.ts'
 
-const TOKEN = 'test-token'
-
-interface RecordedRequest {
-  method: string | undefined
-  path: string | undefined
-  headers: IncomingHttpHeaders
-  body: unknown
-}
-
-interface FakeQueue {
-  url: string
-  requests: RecordedRequest[]
-  emitQueued: (backend: 'pi' | 'claude' | 'codex') => void
-  close: () => Promise<void>
-}
+const projectRoot = import.meta.dirname
+const cliPath = join(projectRoot, 'cli.ts')
 
 interface CliResult {
   code: number | null
@@ -35,91 +25,23 @@ interface CliResult {
   stderr: string
 }
 
-function closeServer(server: Server): Promise<void> {
-  return new Promise((resolve, reject) => {
-    server.close((error) => {
-      if (error) reject(error)
-      else resolve()
-    })
-    server.closeAllConnections()
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
   })
+  return { promise, resolve, reject }
 }
 
-async function startFakeQueue(
-  responseForClaim: (
-    claimNumber: number,
-  ) => QuestionClaimResponse | Promise<QuestionClaimResponse>,
-): Promise<FakeQueue> {
-  const requests: RecordedRequest[] = []
-  const eventClients = new Set<ServerResponse>()
-  let claimCount = 0
-  const server = createServer((req, res) => {
-    if (req.method === 'GET' && req.url === '/api/events') {
-      requests.push({
-        method: req.method,
-        path: req.url,
-        headers: req.headers,
-        body: undefined,
-      })
-      res.writeHead(200, {
-        'content-type': 'text/event-stream',
-        'cache-control': 'no-cache',
-      })
-      res.write('retry: 1000\n: connected\n\n')
-      eventClients.add(res)
-      res.on('close', () => eventClients.delete(res))
-      return
-    }
-
-    const chunks: Buffer[] = []
-    req.on('data', (chunk: Buffer) => chunks.push(chunk))
-    req.on('end', () => {
-      const rawBody = Buffer.concat(chunks).toString('utf8')
-      requests.push({
-        method: req.method,
-        path: req.url,
-        headers: req.headers,
-        body: rawBody ? (JSON.parse(rawBody) as unknown) : undefined,
-      })
-      const response = responseForClaim(++claimCount)
-      void Promise.resolve(response).then((body) => {
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify(body))
-      })
-    })
-  })
-
-  await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error) => reject(error)
-    server.once('error', onError)
-    server.listen(0, '127.0.0.1', () => {
-      server.off('error', onError)
-      resolve()
-    })
-  })
-
-  const address = server.address()
-  if (!address || typeof address === 'string') {
-    await closeServer(server)
-    throw new Error('Fake queue did not bind a TCP port')
-  }
-
-  return {
-    url: `http://127.0.0.1:${address.port}`,
-    requests,
-    emitQueued: (backend) => {
-      const frame =
-        'event: review-changed\n' +
-        `data: ${JSON.stringify({ reason: 'queued', backend })}\n\n`
-      for (const client of eventClients) client.write(frame)
-    },
-    close: () => closeServer(server),
-  }
-}
-
-function runCli(args: string[], timeoutMs = 10_000): Promise<CliResult> {
-  const child = spawn(process.execPath, ['cli.ts', ...args], {
-    cwd: import.meta.dirname,
+function runCli(
+  args: string[],
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
+): Promise<CliResult> {
+  const child = spawn(process.execPath, [cliPath, ...args], {
+    cwd: opts.cwd ?? projectRoot,
+    env: opts.env ?? process.env,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   child.stdout.setEncoding('utf8')
@@ -135,7 +57,7 @@ function runCli(args: string[], timeoutMs = 10_000): Promise<CliResult> {
     const timer = setTimeout(() => {
       timedOut = true
       child.kill('SIGKILL')
-    }, timeoutMs)
+    }, opts.timeoutMs ?? 10_000)
 
     child.once('error', (error) => {
       clearTimeout(timer)
@@ -152,231 +74,169 @@ function runCli(args: string[], timeoutMs = 10_000): Promise<CliResult> {
   })
 }
 
-function serverArgs(queue: FakeQueue): string[] {
-  return ['--server', queue.url, '--token', TOKEN]
+function serverInfoPath(home: string, cwd: string): string {
+  const hash = createHash('sha256').update(cwd).digest('hex').slice(0, 12)
+  return join(home, '.local', 'share', 'skepsis', `${hash}.server.json`)
 }
 
-function claimRequests(queue: FakeQueue): RecordedRequest[] {
-  return queue.requests.filter((request) => request.path === '/api/questions/claim')
+async function initGitRepo(): Promise<{ home: string; repo: string; serverInfo: string }> {
+  const home = await mkdtemp(join(tmpdir(), 'skepsis-cli-home-'))
+  const repo = await mkdtemp(join(tmpdir(), 'skepsis-cli-repo-'))
+  const resolvedRepo = await realpath(repo)
+  execFileSync('git', ['init'], { cwd: resolvedRepo, stdio: 'ignore' })
+  execFileSync('git', ['config', 'user.name', 'Skepsis Test'], {
+    cwd: resolvedRepo,
+    stdio: 'ignore',
+  })
+  execFileSync('git', ['config', 'user.email', 'skepsis@example.com'], {
+    cwd: resolvedRepo,
+    stdio: 'ignore',
+  })
+  await writeFile(join(resolvedRepo, 'example.ts'), 'export const value = 1\n')
+  execFileSync('git', ['add', 'example.ts'], { cwd: resolvedRepo, stdio: 'ignore' })
+  execFileSync('git', ['commit', '-m', 'initial'], { cwd: resolvedRepo, stdio: 'ignore' })
+  await writeFile(join(resolvedRepo, 'example.ts'), 'export const value = 2\n')
+  return { home, repo: resolvedRepo, serverInfo: serverInfoPath(home, resolvedRepo) }
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds))
-}
-
-async function waitForRequest(queue: FakeQueue, path: string): Promise<void> {
-  for (let attempt = 0; attempt < 200; attempt++) {
-    if (queue.requests.some((request) => request.path === path)) return
-    // The spawned TypeScript CLI has a short startup cost.
+async function waitFor(
+  check: () => boolean,
+  failure: string,
+  timeoutMs: number = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (check()) return
     // oxlint-disable-next-line no-await-in-loop
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    await new Promise((resolve) => setTimeout(resolve, 20))
   }
-  throw new Error(`Timed out waiting for ${path}`)
+  throw new Error(failure)
 }
 
-describe('skepsis poll CLI', () => {
-  it('makes one authenticated claim request in one-shot mode', async () => {
-    const queue = await startFakeQueue(() => ({ question: null }))
-    try {
-      const result = await runCli([
-        'poll',
-        '--backend',
-        'claude',
-        '--worker',
-        'test-worker',
-        '--json',
-        ...serverArgs(queue),
-      ])
-
-      expect(result).toMatchObject({ code: 0, signal: null, stdout: '', stderr: '' })
-      expect(claimRequests(queue)).toHaveLength(1)
-      expect(claimRequests(queue)[0]).toMatchObject({
-        method: 'POST',
-        path: '/api/questions/claim',
-        headers: {
-          authorization: `Bearer ${TOKEN}`,
-          'content-type': 'application/json',
-        },
-        body: { backend: 'claude', worker: 'test-worker' },
-      })
-    } finally {
-      await queue.close()
-    }
-  })
-
-  it('prints the ordered conversation for a threaded non-JSON claim', async () => {
-    const question = {
-      id: 'question-thread',
-      backend: 'codex',
-      file: 'src/example.ts',
-      line: 7,
-      question: 'And under concurrency?',
-      messages: [
-        { role: 'user' as const, content: 'Is this safe?' },
-        {
-          role: 'assistant' as const,
-          content: 'It is safe for one caller.',
-          outcome: 'answered' as const,
-        },
-        { role: 'user' as const, content: 'And under concurrency?' },
-      ],
-      excerpt: '> 7 | return value',
-      lineText: 'return value',
-      leaseId: 'lease-thread',
-    } satisfies QuestionClaim
-    const queue = await startFakeQueue(() => ({ question }))
-    try {
-      const result = await runCli(['poll', '--backend', 'codex', ...serverArgs(queue)])
-
-      expect(result.code).toBe(0)
-      expect(result.stdout).toContain('question: And under concurrency?')
-      expect(result.stdout).toContain('conversation:\n  user: Is this safe?')
-      expect(result.stdout).toContain('  assistant (answered): It is safe for one caller.')
-      expect(result.stdout).toContain('  user: And under concurrency?')
-    } finally {
-      await queue.close()
-    }
-  })
-
-  it('waits until one question is available, then exits without over-claiming', async () => {
-    const question = {
-      id: 'question-1',
-      backend: 'codex',
-      file: 'src/example.ts',
-      line: 7,
-      question: 'Why is this needed?',
-      messages: [{ role: 'user', content: 'Why is this needed?' }],
-      excerpt: '> 7 | return value',
-      lineText: 'return value',
-      leaseId: 'lease-1',
-    } satisfies QuestionClaim
-    const queue = await startFakeQueue((requestNumber) => ({
-      question: requestNumber === 2 ? question : null,
-    }))
-
-    try {
-      const resultPromise = runCli([
-        'poll',
-        '--backend',
-        'codex',
-        '--worker',
-        'wait-worker',
-        '--json',
-        '--wait',
-        ...serverArgs(queue),
-      ])
-      await waitForRequest(queue, '/api/events')
-      queue.emitQueued('claude')
-      queue.emitQueued('codex')
-      const result = await resultPromise
-
-      expect(result).toMatchObject({ code: 0, signal: null, stderr: '' })
-      expect(JSON.parse(result.stdout) as unknown).toEqual(question)
-      expect(claimRequests(queue)).toHaveLength(2)
-      expect(
-        queue.requests.filter((request) => request.path === '/api/events'),
-      ).toHaveLength(1)
-    } finally {
-      await queue.close()
-    }
-  })
-
-  it('exits silently when a numeric wait expires with no question', async () => {
-    const queue = await startFakeQueue(() => ({ question: null }))
-    try {
-      const result = await runCli([
-        'poll',
-        '--json',
-        '--wait',
-        '0.05',
-        ...serverArgs(queue),
-      ])
-
-      expect(result).toMatchObject({ code: 0, signal: null, stdout: '', stderr: '' })
-      expect(claimRequests(queue)).toHaveLength(1)
-      expect(
-        queue.requests.filter((request) => request.path === '/api/events'),
-      ).toHaveLength(1)
-    } finally {
-      await queue.close()
-    }
-  })
-
-  it('finishes and prints a claim started before the numeric deadline', async () => {
-    const question = {
-      id: 'question-delayed',
-      backend: 'codex',
-      file: 'src/example.ts',
-      line: 7,
-      question: 'Why wait?',
-      messages: [{ role: 'user', content: 'Why wait?' }],
-      excerpt: '> 7 | return value',
-      lineText: 'return value',
-      leaseId: 'lease-delayed',
-    } satisfies QuestionClaim
-    const queue = await startFakeQueue(async () => {
-      await delay(100)
-      return { question }
-    })
-    try {
-      const result = await runCli([
-        'poll',
-        '--json',
-        '--wait',
-        '0.05',
-        ...serverArgs(queue),
-      ])
-
-      expect(result).toMatchObject({ code: 0, signal: null, stderr: '' })
-      expect(JSON.parse(result.stdout) as unknown).toEqual(question)
-      expect(claimRequests(queue)).toHaveLength(1)
-    } finally {
-      await queue.close()
-    }
-  })
-
-  it('does not start another claim after a delayed empty claim crosses the deadline', async () => {
-    const queue = await startFakeQueue(async () => {
-      await delay(100)
-      return { question: null }
-    })
-    try {
-      const resultPromise = runCli([
-        'poll',
-        '--backend',
-        'codex',
-        '--json',
-        '--wait',
-        '0.05',
-        ...serverArgs(queue),
-      ])
-      await waitForRequest(queue, '/api/questions/claim')
-      queue.emitQueued('codex')
-      const result = await resultPromise
-
-      expect(result).toMatchObject({ code: 0, signal: null, stdout: '', stderr: '' })
-      expect(claimRequests(queue)).toHaveLength(1)
-    } finally {
-      await queue.close()
-    }
-  })
-
-  it('rejects invalid and nonpositive wait values before polling', async () => {
-    const queue = await startFakeQueue(() => ({ question: null }))
-    try {
+describe('skepsis CLI', () => {
+  it(
+    'reports removed external-question commands with a helpful migration error',
+    { timeout: 15_000 },
+    async () => {
       const results = await Promise.all(
-        ['nope', '0', '-1'].map((value) =>
-          runCli(['poll', `--wait=${value}`, '--json', ...serverArgs(queue)]),
-        ),
+        ['poll', 'answer', 'fail'].map((command) => runCli([command])),
       )
-      for (const result of results) {
+
+      for (const [index, command] of ['poll', 'answer', 'fail'].entries()) {
+        const result = results[index]!
         expect(result.code).toBe(1)
         expect(result.stdout).toBe('')
-        expect(result.stderr).toContain('--wait must be a positive number of seconds')
+        expect(result.stderr).toContain(`skepsis ${command} was removed`)
+        expect(result.stderr).toContain('There is no external question worker CLI anymore.')
       }
-      expect(queue.requests).toHaveLength(0)
-    } finally {
-      await queue.close()
-    }
+    },
+  )
+
+  it('does not spawn late children after SIGTERM races startup', async () => {
+    const server = deferred<{ port: number; close: () => Promise<void> }>()
+    let closed = 0
+    let spawned = 0
+
+    const serving = runServe(
+      [],
+      { git: true, revisions: 'HEAD', dev: true, host: 'localhost' },
+      {
+        startServer: async () => server.promise,
+        spawn: (() => {
+          spawned += 1
+          throw new Error('runServe spawned a child after shutdown started')
+        }) as typeof spawn,
+      },
+    )
+
+    expect(process.emit('SIGTERM', 'SIGTERM')).toBe(true)
+    server.resolve({
+      port: 43123,
+      close: async () => {
+        closed += 1
+      },
+    })
+
+    await expect(serving).resolves.toBeUndefined()
+    expect(closed).toBe(1)
+    expect(spawned).toBe(0)
   })
+
+  it('bounds child shutdown by escalating to SIGKILL when needed', async () => {
+    const child = spawn(
+      process.execPath,
+      ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000)"],
+      {
+        stdio: 'ignore',
+      },
+    )
+
+    const start = Date.now()
+    await stopChild(child, 100)
+    const elapsedMs = Date.now() - start
+
+    expect(elapsedMs).toBeLessThan(5_000)
+    expect(child.signalCode ?? child.exitCode).not.toBeNull()
+  })
+
+  it(
+    'clears discovery state and exits cleanly after SIGTERM',
+    { timeout: 15_000 },
+    async () => {
+      const { home, repo, serverInfo } = await initGitRepo()
+      const child = spawn(
+        process.execPath,
+        [cliPath, '--git', '-r', 'HEAD', '--host', '127.0.0.1'],
+        {
+          cwd: repo,
+          env: { ...process.env, HOME: home },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      )
+      child.stdout.setEncoding('utf8')
+      child.stderr.setEncoding('utf8')
+
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', (chunk: string) => {
+        stdout += chunk
+      })
+      child.stderr.on('data', (chunk: string) => {
+        stderr += chunk
+      })
+
+      try {
+        await waitFor(
+          () => stdout.includes('skepsis on http://127.0.0.1:'),
+          `server never started\nstdout: ${stdout}\nstderr: ${stderr}`,
+        )
+        await waitFor(() => existsSync(serverInfo), 'discovery file was never written')
+
+        child.kill('SIGTERM')
+        const result = await new Promise<CliResult>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            child.kill('SIGKILL')
+            reject(
+              new Error(`CLI timed out on shutdown\nstdout: ${stdout}\nstderr: ${stderr}`),
+            )
+          }, 10_000)
+          child.once('error', (error) => {
+            clearTimeout(timer)
+            reject(error)
+          })
+          child.once('close', (code, signal) => {
+            clearTimeout(timer)
+            resolve({ code, signal, stdout, stderr })
+          })
+        })
+
+        expect(result).toMatchObject({ code: 0, signal: null, stderr: '' })
+        expect(existsSync(serverInfo)).toBe(false)
+      } finally {
+        child.kill('SIGKILL')
+        await rm(home, { recursive: true, force: true })
+        await rm(repo, { recursive: true, force: true })
+      }
+    },
+  )
 })

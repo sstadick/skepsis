@@ -92,6 +92,8 @@
   --red: light-dark(oklch(53% 0.19 27), oklch(66% 0.2 27));
   --amber: light-dark(oklch(50% 0.12 80), oklch(72% 0.14 80));
   --amber-deep: light-dark(oklch(52% 0.11 78), oklch(56% 0.12 78));
+  --score-attention-medium: light-dark(oklch(56% 0.12 80), oklch(72% 0.14 80));
+  --score-attention-high: light-dark(oklch(57% 0.18 29), oklch(68% 0.19 27));
 
   /* Monospace stack. Berkeley Mono first for those who have it, then each OS's
      best system mono (ui-monospace → SF Mono on macOS, Consolas/Cascadia on
@@ -659,6 +661,60 @@ body,
   background: var(--bg-control);
 }
 
+.score-controls {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.score-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
+  color: var(--fg-dim);
+}
+
+.score-status.waiting {
+  color: var(--amber);
+}
+
+.score-status.running {
+  color: var(--fg);
+}
+
+.score-spinner {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  animation: score-spin 0.8s linear infinite;
+}
+
+.score-error {
+  max-width: 34ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--red);
+  font-size: 12px;
+}
+
+.score-tooltip-copy {
+  display: block;
+  max-width: 32ch;
+  white-space: normal;
+  line-height: 1.35;
+}
+
+@keyframes score-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* Gutter "+" button for adding comments */
 .add-comment-button {
   width: 22px;
@@ -688,6 +744,62 @@ body,
   border-top: 1px solid var(--border);
 }
 
+.comment-form-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.comment-form-mode-picker {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.comment-form-mode-button,
+.comment-form-help-button {
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-control);
+  color: var(--fg-muted);
+  font-family:
+    system-ui,
+    -apple-system,
+    sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.comment-form-mode-button:hover:not(:disabled),
+.comment-form-help-button:hover:not(:disabled) {
+  background: var(--bg-control-hover);
+  border-color: var(--border-muted);
+  color: var(--fg-bright);
+}
+
+.comment-form-mode-button:disabled,
+.comment-form-help-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.comment-form-mode-button.is-active {
+  color: var(--fg-bright);
+  border-color: color-mix(in oklch, var(--blue) 55%, var(--border));
+  background: color-mix(in oklch, var(--blue) 12%, var(--bg-control));
+}
+
+.comment-form-help-button {
+  min-width: 30px;
+  padding-inline: 0;
+  color: var(--fg-dim);
+}
+
 .comment-form textarea {
   width: 100%;
   min-height: 60px;
@@ -710,6 +822,13 @@ body,
   border-color: var(--blue);
 }
 
+.comment-form-help {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .comment-form-note {
   color: var(--fg-muted);
   font-family:
@@ -717,17 +836,18 @@ body,
     -apple-system,
     sans-serif;
   font-size: 12px;
+  line-height: 1.4;
   /* nudge right: text flush with the textarea's outer edge reads as
      overhanging it, since the textarea's own text sits inside its border */
   padding-left: 2px;
-  margin-right: auto;
 }
 
 .comment-form-actions {
   display: flex;
   justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 8px;
-  margin-top: 8px;
+  margin-top: 10px;
   align-items: center;
 }
 
@@ -738,6 +858,10 @@ body,
     -apple-system,
     sans-serif;
   font-size: 13px;
+}
+
+.comment-form-actions .comment-form-error {
+  margin-right: auto;
 }
 
 .btn {
@@ -909,6 +1033,23 @@ body,
   outline-offset: -1px;
 }
 
+.review-thread-pending-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.review-thread-note {
+  margin-top: 4px;
+  color: var(--fg-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.review-thread-follow-up-note {
+  margin-top: 8px;
+}
+
 .review-thread-follow-up-actions {
   min-height: 30px;
   margin-top: 8px;
@@ -975,6 +1116,27 @@ body,
   white-space: nowrap;
   padding-right: 24px;
   color: var(--fg-muted);
+}
+
+.review-help-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.review-help-list li {
+  margin-bottom: 10px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.review-help-list li:last-child {
+  margin-bottom: 0;
+}
+
+.review-help-actions {
+  margin-top: 16px;
+  display: flex;
+  justify-content: flex-end;
 }
 
 /* Positioning context for the toast: the toast floats centered over the

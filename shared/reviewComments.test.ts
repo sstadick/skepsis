@@ -124,6 +124,53 @@ describe('parseReviewThread', () => {
     })
   })
 
+  it('strips an explicit comment marker and keeps literal @pi prose plain', () => {
+    expect(
+      parseReviewThread(
+        ['Skepsis-Comment: 1', '', '@pi Discuss this literally.'],
+        BARE_COMMENT,
+        '',
+        THREAD_ID,
+      ),
+    ).toEqual({
+      kind: 'comment',
+      body: '@pi Discuss this literally.',
+      threadId: THREAD_ID,
+    })
+  })
+
+  it('strips an explicit agent marker before parsing a managed question', () => {
+    const parsed = parseReviewThread(
+      [
+        'Skepsis-Agent: 1',
+        '',
+        '@pi Why is this safe?',
+        '',
+        '`Skepsis-State:` answered is quoted here.',
+      ],
+      BARE_COMMENT,
+      '',
+      THREAD_ID,
+    )
+
+    expect(parsed).toEqual({
+      kind: 'question',
+      backend: 'pi',
+      embedded: true,
+      question: 'Why is this safe?\n\nSkepsis-State: answered is quoted here.',
+      messages: [
+        {
+          role: 'user',
+          content: 'Why is this safe?\n\nSkepsis-State: answered is quoted here.',
+        },
+      ],
+      status: 'pending',
+      threadId: THREAD_ID,
+    })
+    expect(parsed.kind).toBe('question')
+    if (parsed.kind === 'question') expect(parsed.embedded).toBe(true)
+  })
+
   it('does not decode inline code in an unmarked ordinary comment', () => {
     expect(
       parseReviewThread(['Old note about `Answer:` and `Skepsis-State:`.'], BARE_COMMENT),
@@ -144,19 +191,21 @@ describe('parseReviewThread', () => {
   })
 
   it('parses a pending agent question and removes source comment decoration', () => {
-    expect(
-      parseReviewThread(
-        ['  // @claude: Why is this safe?\n', '  // Please cite the guard.\n'],
-        SLASH_COMMENT,
-        '  ',
-      ),
-    ).toEqual({
+    const parsed = parseReviewThread(
+      ['  // @claude: Why is this safe?\n', '  // Please cite the guard.\n'],
+      SLASH_COMMENT,
+      '  ',
+    )
+
+    expect(parsed).toEqual({
       kind: 'question',
       backend: 'claude',
       question: 'Why is this safe?\nPlease cite the guard.',
       messages: [{ role: 'user', content: 'Why is this safe?\nPlease cite the guard.' }],
       status: 'pending',
     })
+    expect(parsed.kind).toBe('question')
+    if (parsed.kind === 'question') expect(parsed.embedded).toBeUndefined()
   })
 
   it('keeps non-framing Skepsis prose in a managed pending question', () => {

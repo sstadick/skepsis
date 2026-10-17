@@ -6,7 +6,7 @@
  * Copyright Oxide Computer Company
  */
 
-import type { AgentBackend, QuestionConversationMessage } from './types.ts'
+import type { AgentBackend, QuestionConversationMessage, ReviewBodyKind } from './types.ts'
 
 export type CommentSyntax = { prefix: string; suffix?: string }
 
@@ -102,11 +102,15 @@ export type ReviewThreadContent =
       threadId?: string
       /** The original question. `messages` contains the complete thread. */
       question: string
+      /** Present only for Skepsis-embedded questions with the explicit marker. */
+      embedded?: true
       messages: QuestionConversationMessage[]
       status: 'pending' | 'answered' | 'failed'
     }
 
 const AGENT_QUESTION_PREFIX = /^\s*@(pi|claude|codex)\b[:\s-]*/i
+export const SKEPSIS_AGENT_MARKER = 'Skepsis-Agent: 1\n\n'
+export const SKEPSIS_COMMENT_MARKER = 'Skepsis-Comment: 1\n\n'
 export const SKEPSIS_ANSWER_SEPARATOR = '\n\nSkepsis-Answer:\n'
 export const SKEPSIS_FAILURE_SEPARATOR = '\n\nSkepsis-Failure:\n'
 export const SKEPSIS_ANSWER_STATE = '\n\nSkepsis-State: answered'
@@ -119,6 +123,8 @@ export const REVIEW_STORAGE_RESERVED_TOKENS = [
   REVIEW_OPEN_TAG,
   '<review ',
   REVIEW_CLOSE_TAG,
+  SKEPSIS_AGENT_MARKER,
+  SKEPSIS_COMMENT_MARKER,
   'Skepsis-Answer:',
   'Skepsis-Failure:',
   'Skepsis-Followup:',
@@ -126,6 +132,19 @@ export const REVIEW_STORAGE_RESERVED_TOKENS = [
   'Skepsis-Thread:',
   'Answer:',
 ] as const
+
+export function splitSerializedReviewBody(text: string): {
+  marker: ReviewBodyKind | null
+  body: string
+} {
+  if (text.startsWith(SKEPSIS_COMMENT_MARKER)) {
+    return { marker: 'comment', body: text.slice(SKEPSIS_COMMENT_MARKER.length) }
+  }
+  if (text.startsWith(SKEPSIS_AGENT_MARKER)) {
+    return { marker: 'question', body: text.slice(SKEPSIS_AGENT_MARKER.length) }
+  }
+  return { marker: null, body: text }
+}
 
 const THREAD_MARKER_PATTERN = new RegExp(
   `${escapeRegex(
@@ -262,6 +281,13 @@ export function parseReviewOpenTag(
   return { managed: true, threadId: match[1]! }
 }
 
+function markEmbeddedQuestion<T extends Extract<ReviewThreadContent, { kind: 'question' }>>(
+  thread: T,
+  embedded: boolean,
+): T {
+  return embedded ? { ...thread, embedded: true } : thread
+}
+
 function questionFromPrompt(
   prompt: string,
 ): { backend: AgentBackend; question: string } | null {
@@ -378,8 +404,19 @@ export function parseReviewThread(
   managedThreadId?: string,
 ): ReviewThreadContent {
   const unwrappedLines = bodyLines.map((line) => unwrapReviewLine(line, syntax, indent))
-  const body = unwrappedLines.join('\n').trim()
-  const decodeBase = managedThreadId
+  const serialized = splitSerializedReviewBody(unwrappedLines.join('\n').trim())
+  if (serialized.marker === 'comment') {
+    return {
+      kind: 'comment',
+      body: decodeReviewStorageText(serialized.body),
+      ...(managedThreadId ? { threadId: managedThreadId } : {}),
+    }
+  }
+
+  const body = serialized.body
+  const embedded = serialized.marker === 'question'
+  const usesManagedStorage = managedThreadId !== undefined || embedded
+  const decodeBase = usesManagedStorage
     ? decodeReviewStorageText
     : (text: string): string => text
   const threadMarker = findThreadMarker(body)
@@ -397,8 +434,12 @@ export function parseReviewThread(
   // Managed payloads escape every reserved token. Only the one parsed result
   // frame may remain raw in the base exchange; extensions validate each of
   // their payload segments separately.
-  if (managedThreadId && !isManagedBaseValid(legacyBody, result)) {
-    return { kind: 'comment', body, threadId: managedThreadId }
+  if (usesManagedStorage && !isManagedBaseValid(legacyBody, result)) {
+    return {
+      kind: 'comment',
+      body,
+      ...(managedThreadId ? { threadId: managedThreadId } : {}),
+    }
   }
 
   const parsed = questionFromPrompt(result?.prompt ?? legacyBody)
@@ -457,22 +498,28 @@ export function parseReviewThread(
     }
     messages.push(...extension.messages)
     const threadId = managedThreadId ?? threadMarker.threadId
-    return {
-      kind: 'question',
-      backend: parsed.backend,
-      ...(threadId ? { threadId } : {}),
-      question: decodeBase(parsed.question),
-      messages,
-      status: extension.status,
-    }
+    return markEmbeddedQuestion(
+      {
+        kind: 'question',
+        backend: parsed.backend,
+        ...(threadId ? { threadId } : {}),
+        question: decodeBase(parsed.question),
+        messages,
+        status: extension.status,
+      },
+      embedded,
+    )
   }
 
-  return {
-    kind: 'question',
-    backend: parsed.backend,
-    ...(managedThreadId ? { threadId: managedThreadId } : {}),
-    question: decodeBase(parsed.question),
-    messages,
-    status: result?.status ?? 'pending',
-  }
+  return markEmbeddedQuestion(
+    {
+      kind: 'question',
+      backend: parsed.backend,
+      ...(managedThreadId ? { threadId: managedThreadId } : {}),
+      question: decodeBase(parsed.question),
+      messages,
+      status: result?.status ?? 'pending',
+    },
+    embedded,
+  )
 }

@@ -7,6 +7,9 @@ A fully local browser-based code review UI. Review your (or your agent's) diff _
 - GitHub-style split or unified diff view with syntax highlighting
 - Mark files as viewed
 - Inline review comments are written directly into source files as code comments
+- Ask agent questions inline; answers and follow-ups stay with the source
+- Raw `<review>` storage markers stay hidden in the rendered frontend
+- Optional per-hunk review-priority scoring for changed lines
 - Works with [jj](https://jj-vcs.dev/) and git (tries jj first, falls back to git)
 - Vim-style navigation shortcuts (press `?` to see the list)
 
@@ -14,7 +17,11 @@ https://github.com/user-attachments/assets/698365ab-964c-4e38-a605-82bec4879f60
 
 ## Setup
 
-Requires [Node.js](https://nodejs.org/) v22+.
+Requires [Node.js](https://nodejs.org/) v22.19+.
+
+When running from a source checkout, Skepsis relies on Node's built-in
+strip-only TypeScript support. The published npm package already ships compiled
+JavaScript.
 
 Run it without installing:
 
@@ -42,9 +49,34 @@ Either way, you may want a shorter alias:
 alias sk="npx @oxide/skepsis"
 ```
 
+### Embedded model runtime
+
+Skepsis owns its own embedded Ask agent/scoring runtime. There is no external
+Skepsis worker CLI, no separate `pi` session to start, and no repo-local Pi
+extensions or skills involved in the user-facing flow.
+
+For **Ask agent**, Skepsis uses embedded
+[`@earendil-works/pi-durable`](https://www.npmjs.com/package/@earendil-works/pi-durable),
+reads the current user's global Pi auth/model configuration and catalog
+(normally under `~/.pi/`), and exposes exactly one repository tool to the
+model: read-only `read_file` for numbered file snippets. Through Skepsis, the
+agent cannot edit files, run commands, or load repo-local extensions.
+
+Per managed review thread, Skepsis stores durable JSONL state plus a
+host-registered request record under
+`~/.local/share/skepsis/<cwd-digest>.agents`. After a restart, Skepsis only
+resumes requests it previously registered locally; marker text found in source
+files by itself does not start or resume work.
+
+For **Score**, Skepsis uses the native H2O classifier endpoint configured by
+`H2O_BASE_URL` (default `http://127.0.0.1:8009/v1`). Opening a diff does
+**not** call a model by itself. Inference only starts when you submit
+**Ask agent**, trigger **Score**, or Skepsis resumes a previously pending local
+question after a restart.
+
 ## Usage
 
-Takes `-r`/`--revision`, `-f`/`--from`, and `-t`/`--to` flags for specifying
+Takes `-r`/`--revisions`, `-f`/`--from`, and `-t`/`--to` flags for specifying
 the commit range. The VCS is auto-detected. In jj mode, the flags are passed
 straight to `jj diff`. In git mode, they have to be translated slightly. See the
 examples below.
@@ -91,16 +123,58 @@ bundle, so installing or running with `npx` does not build anything. In dev
 mode (`--dev`), a Vite dev server runs alongside the API server with hot
 reload from a source checkout.
 
-### Comments
+## Local annotations: Review comment vs Ask agent
 
-Review comments are inserted into the source files, so they show up in your VCS
-diff and are visible to coding agents. They can be resolved (deleted) from the
-UI. Comments are only enabled when the diff includes the working copy (e.g.,
-a revset ending in `@` for jj, or an open-ended range ending at the working
-tree for git), since that's where the inserted lines land. The default diff
-in both modes ends at the working copy, so comments are enabled by default.
+Open the composer from the gutter **+** button or press `c` on the selected line.
 
-### Marking files viewed
+- **Review comment** leaves a local note inline in this diff. It does not ask a
+  model for anything.
+- **Ask agent** asks a question about this code. Skepsis answers inline with the
+  configured Pi model, and follow-ups keep the full local thread context.
+
+Both modes write source-backed local annotations into your working files. In
+source, those live inside comment-wrapped `<review>...</review>` blocks, plus
+Skepsis metadata markers for managed agent threads. The rendered frontend hides
+those storage rows and shows an inline discussion card instead.
+
+These are **not** GitHub review comments or GitHub discussions, and Skepsis has
+no Publish step. If you want the content in a PR review, copy it manually
+before resolving the local annotation or committing the file.
+
+Review comments and Ask agent are only enabled when the diff includes the
+working copy (for example, a jj revset ending in `@`, or a git diff that ends
+at the working tree), because Skepsis inserts real comment lines into files on
+disk. The default diff in both modes ends at the working copy, so local
+annotations are enabled by default.
+
+## Review priority scoring
+
+Click **Score** in the top progress bar, or run `skepsis score` from the same
+repository while Skepsis is running. The CLI discovers the already-running
+server for that repository and tells it to start embedded scoring; it does not
+start a second server and it does not require an external `pi` session.
+
+Scoring uses Skepsis's embedded local `h2o-local/h2o-lightning-4b` native
+classifier, not the chat model, and runs up to **four hunks concurrently**.
+Each hunk gets the bool answer's **P(important)**. Only changed-line gutters
+are colored, from transparent through amber to red; source backgrounds, file
+headers, and viewed state are unchanged. This is an advisory attention signal,
+**not a calibrated probability of a bug**. Low scores do not mean safe.
+
+Scores appear incrementally over server events and survive reloads/restarts.
+The cache lives under `~/.local/share/skepsis/`, isolated by repository and the
+versioned scoring profile (model + rubric). Hunk content, path, and function
+context identify a score; line-number shifts reuse it, changed hunks do not.
+Entries expire after 30 days. Scores never write to source files and also work
+for read-only revision ranges.
+
+`skepsis score cancel` clears pending scoring work and visible scoring failures,
+but keeps completed scores. Retry only needs to recompute failed or missing
+hunks. Oversized hunks (over 24,000 UTF-8 bytes) remain unscored with an
+explicit error rather than being silently truncated; binary and mode-only
+changes have no text hunks to score.
+
+## Marking files viewed
 
 Viewed state is stored per file in `~/.local/share/skepsis/` using the file's
 content hash (the git object ID from the diff header). If the file changes, the
@@ -115,12 +189,12 @@ git clone https://github.com/oxidecomputer/skepsis.git
 cd skepsis && npm install
 ```
 
-Running from a checkout requires Node v22.18+, since the CLI runs as
-TypeScript directly via Node's built-in type stripping. Point an alias at the
-clone to run it from any repo:
+Running from a checkout also requires Node v22.19+, since the CLI runs as
+TypeScript directly via Node's built-in strip-only support. Point an alias at
+the clone to run it from any repo:
 
 ```
-alias sk="node ~/repos/skepsis/cli.ts"
+alias sk="node /path/to/skepsis/cli.ts"
 ```
 
 `--dev` runs a Vite dev server with hot reload alongside the API server:

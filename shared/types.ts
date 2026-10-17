@@ -25,10 +25,14 @@ export const viewedDeleteAllSchema = z.object({
   files: z.array(viewedDeleteSchema),
 })
 
+export const REVIEW_BODY_KINDS = ['comment', 'question'] as const
+export type ReviewBodyKind = (typeof REVIEW_BODY_KINDS)[number]
+
 export const commentRequestSchema = z.object({
   file: z.string(),
   afterLine: z.number(),
   text: z.string(),
+  kind: z.enum(REVIEW_BODY_KINDS).default('comment'),
 })
 
 export const commentDeleteSchema = z.object({
@@ -47,21 +51,6 @@ export const commentFollowUpSchema = z.object({
 export const AGENT_BACKENDS = ['pi', 'claude', 'codex'] as const
 export type AgentBackend = (typeof AGENT_BACKENDS)[number]
 
-export const questionClaimRequestSchema = z.object({
-  backend: z.enum(AGENT_BACKENDS).optional(),
-  worker: z.string().optional(),
-})
-
-export const questionAnswerRequestSchema = z.object({
-  leaseId: z.string(),
-  answer: z.string(),
-})
-
-export const questionFailRequestSchema = z.object({
-  leaseId: z.string(),
-  error: z.string(),
-})
-
 export const fileContentsQuerySchema = z.object({
   path: z.string(),
   // Present for renamed files: the path to fetch the old-side content from.
@@ -74,9 +63,6 @@ export type ViewedRequest = z.infer<typeof viewedRequestSchema>
 export type CommentRequest = z.infer<typeof commentRequestSchema>
 export type CommentDeleteRequest = z.infer<typeof commentDeleteSchema>
 export type CommentFollowUpRequest = z.infer<typeof commentFollowUpSchema>
-export type QuestionClaimRequest = z.infer<typeof questionClaimRequestSchema>
-export type QuestionAnswerRequest = z.infer<typeof questionAnswerRequestSchema>
-export type QuestionFailRequest = z.infer<typeof questionFailRequestSchema>
 
 // --- UI types ---
 
@@ -121,6 +107,26 @@ export type DiffArgs = ({ vcs: 'jj'; args: string[] } | { vcs: 'git'; args: stri
 export type ViewedMap = Record<string, string>
 export type FileHashes = Record<string, string>
 
+/** Original diff ranges on both sides, including deletion-only hunks.
+ *  The score is P(important), not a calibrated probability of a defect. */
+export interface HunkScore {
+  newStart: number
+  newCount: number
+  oldStart: number
+  oldCount: number
+  score: number
+}
+
+export interface ScoringSummary {
+  queued: number
+  claimed: number
+  failed: number
+  error?: string
+}
+
+/** Per-file hunk scores. Absent files and hunks simply have no score yet. */
+export type FileScores = Record<string, HunkScore[]>
+
 export interface DiffResponse {
   patch: string
   revset: string
@@ -136,6 +142,9 @@ export interface DiffResponse {
    *  file type wasn't recognized. Both get bare review tags on insert. Always
    *  empty when comments are disabled. */
   commentSyntaxes: Record<string, CommentSyntax | null>
+  /** Cached per-hunk review scores, empty until the scorer has run. */
+  scores: FileScores
+  scoring: ScoringSummary
   error?: string
 }
 
@@ -166,40 +175,11 @@ export interface CommentResponse {
   question?: QuestionSummary
 }
 
-export interface QuestionJob {
-  id: string
-  threadId: string
-  backend: AgentBackend
-  file: string
-  line: number
-  question: string
-  messages: QuestionConversationMessage[]
-  excerpt: string
-  lineText: string
-  commentOpenLine: number
-  state: 'queued' | 'claimed' | 'answered' | 'failed'
-  createdAt: number
-  claimedAt?: number
-  claimedBy?: string
-  leaseId?: string
-  answer?: string
-  error?: string
-}
-
-export interface QuestionClaim {
-  id: string
-  backend: AgentBackend
-  file: string
-  line: number
-  question: string
-  messages: QuestionConversationMessage[]
-  excerpt: string
-  lineText: string
-  leaseId: string
-}
-
-export interface QuestionClaimResponse {
-  question: QuestionClaim | null
+/** Result of triggering a scoring pass: how many hunks were newly queued and
+ *  how many remain unscored and in-flight. */
+export interface ScoreTriggerResponse {
+  queued: number
+  pending: number
 }
 
 export interface ErrorResponse {

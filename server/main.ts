@@ -7,41 +7,44 @@
  */
 
 import { Hono } from 'hono'
-import { streamSSE } from 'hono/streaming'
+import { type SSEStreamingApi, streamSSE } from 'hono/streaming'
 import { serve } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { zValidator } from '@hono/zod-validator'
+import { z } from 'zod'
 import { join, relative } from 'node:path'
 import { readFile } from 'node:fs/promises'
 import type { DiffArgs } from '../shared/types.ts'
 import { getDiff } from './diff.ts'
+import { parseHunks } from './hunks.ts'
+import { loadFileScores } from './scores.ts'
+import { registerScoreRoutes } from './scoreRoutes.ts'
 import { displayCommand } from './displayCommand.ts'
 import { getFileContents } from './fileContents.ts'
 import { loadViewed, markViewed, unmarkViewed, unmarkViewedAll } from './viewed.ts'
 import { appendComment, insertComment, readComment, removeComment } from './comment.ts'
 import { clearServerInfo, createServerToken, writeServerInfo } from './discovery.ts'
+import { AgentReviewCoordinator, buildManagedQuestion } from './agentReview.ts'
 import {
   appendQuestionFollowUp,
   getQuestionContext,
-  parseAgentQuestion,
-  questionAnswerSuffix,
-  questionFailureSuffix,
-  QuestionStore,
+  hasSerializedQuestionMarker,
+  parseStoredReviewThread,
+  resolveSafeReviewFilePath,
+  serializeEmbeddedQuestion,
   serializeNewReviewBody,
 } from './questions.ts'
-import { BARE_COMMENT, parseReviewThread } from '../shared/reviewComments.ts'
 import { getCommentSyntaxes } from './commentSyntax.ts'
 import { loadTheme, saveTheme, themeBootScript } from './settings.ts'
+import { createEmbeddedRuntime } from './embeddedRuntime.ts'
+import type { AgentRuntime } from './agentRuntime.ts'
 import {
   viewedRequestSchema,
   viewedDeleteSchema,
   viewedDeleteAllSchema,
-  commentRequestSchema,
   commentDeleteSchema,
   commentFollowUpSchema,
-  questionClaimRequestSchema,
-  questionAnswerRequestSchema,
-  questionFailRequestSchema,
+  commentRequestSchema as sharedCommentRequestSchema,
   fileContentsQuerySchema,
   themeRequestSchema,
 } from '../shared/types.ts'
@@ -52,7 +55,6 @@ import type {
   ErrorResponse,
   FileContentsResponse,
   OkResponse,
-  QuestionClaimResponse,
   ThemeResponse,
 } from '../shared/types.ts'
 
@@ -66,6 +68,7 @@ type ReviewChange =
       backend: AgentBackend
       state: 'queued' | 'answered' | 'failed'
     }
+  | { reason: 'score-queued' | 'scored'; pending: number }
 
 interface PublishedReviewChange {
   id: string
@@ -73,27 +76,48 @@ interface PublishedReviewChange {
 }
 
 const EVENT_HEARTBEAT_MS = 15_000
+const commentRequestSchema =
+  'kind' in sharedCommentRequestSchema.shape
+    ? sharedCommentRequestSchema
+    : sharedCommentRequestSchema.extend({
+        // Compatibility fallback until shared/types.ts grows the enum.
+        kind: z.enum(['comment', 'question']).default('comment'),
+      })
 
 export async function startServer(opts: {
   diffSource: DiffArgs
   port?: number
   hostname?: string
   cwd: string
-}): Promise<{ port: number; close: () => void }> {
+  runtime?: AgentRuntime
+}): Promise<{ port: number; close: () => Promise<void> }> {
   const { diffSource, port = 0, hostname = 'localhost', cwd } = opts
   // Fail fast on bad args by running the exact diff command we'll serve.
   // Result is discarded: /api/diff re-runs it per request to stay fresh.
   await getDiff(diffSource)
 
   const app = new Hono()
-  const questions = new QuestionStore()
+  const runtime = opts.runtime ?? createEmbeddedRuntime(cwd)
   const serverToken = createServerToken()
   const reviewChangeListeners = new Set<(event: PublishedReviewChange) => void>()
+  const reviewEventStreams = new Set<SSEStreamingApi>()
   let reviewChangeId = 0
   let reviewMutationTail: Promise<void> = Promise.resolve()
 
-  function unauthorized(auth: string | undefined): ErrorResponse | null {
-    return auth === `Bearer ${serverToken}` ? null : { error: 'Unauthorized' }
+  function assertCommentsEnabled(): void {
+    if (!diffSource.commentsEnabled) {
+      throw new Error(
+        'Review comments are only available when diffing against the working copy',
+      )
+    }
+  }
+
+  async function assertSafeReviewFile(file: string): Promise<void> {
+    await resolveSafeReviewFilePath(cwd, file)
+  }
+
+  function closeReviewEventStreams(): void {
+    for (const stream of reviewEventStreams) stream.abort()
   }
 
   function publishReviewChange(data: ReviewChange): void {
@@ -115,28 +139,26 @@ export async function startServer(opts: {
     return result
   }
 
-  async function assertThreadIdentity(
-    file: string,
-    commentOpenLine: number,
-    threadId: string,
-  ): Promise<void> {
-    const current = await readComment(cwd, file, commentOpenLine)
-    const thread = parseReviewThread(
-      current.text.split('\n'),
-      BARE_COMMENT,
-      '',
-      current.threadId,
-    )
-    if (thread.threadId !== threadId) {
-      throw new Error('The review thread moved; refresh and try again')
-    }
-  }
+  const agentReviews = new AgentReviewCoordinator({
+    cwd,
+    runtime,
+    mutate: withReviewMutation,
+    publish: (data) => publishReviewChange(data),
+  })
+  const scoring = registerScoreRoutes(app, {
+    cwd,
+    runtime,
+    patch: async () => (await getDiff(diffSource)).patch,
+    publish: (reason, pending) => publishReviewChange({ reason, pending }),
+    mutate: withReviewMutation,
+  })
 
   app.get('/api/events', (c) => {
     // Disable buffering in reverse proxies while remaining harmless for the
     // normal direct localhost connection.
     c.header('X-Accel-Buffering', 'no')
     return streamSSE(c, async (stream) => {
+      reviewEventStreams.add(stream)
       const pending: PublishedReviewChange[] = []
       let wake: (() => void) | undefined
       const listener = (event: PublishedReviewChange) => {
@@ -146,6 +168,7 @@ export async function startServer(opts: {
       reviewChangeListeners.add(listener)
 
       const cleanUp = () => {
+        reviewEventStreams.delete(stream)
         reviewChangeListeners.delete(listener)
         wake?.()
       }
@@ -195,20 +218,32 @@ export async function startServer(opts: {
   })
 
   app.get('/api/diff', async (c) => {
-    const { patch, fileHashes } = await getDiff(diffSource)
-    const viewed = await loadViewed(cwd, fileHashes)
-    const commentSyntaxes = diffSource.commentsEnabled
-      ? await getCommentSyntaxes(cwd, Object.keys(fileHashes))
-      : {}
+    const snapshot = await withReviewMutation(async () => {
+      const { patch, fileHashes } = await getDiff(diffSource)
+      const viewed = await loadViewed(cwd, fileHashes)
+      const hunks = parseHunks(patch)
+      const scores = await loadFileScores(cwd, hunks)
+      const changedFiles = Object.keys(fileHashes)
+      if (diffSource.commentsEnabled) {
+        await agentReviews.recoverPendingQuestions(changedFiles)
+      }
+      const commentSyntaxes = diffSource.commentsEnabled
+        ? await getCommentSyntaxes(cwd, changedFiles)
+        : {}
+      return { patch, fileHashes, viewed, hunks, scores, commentSyntaxes }
+    })
+
     return c.json({
-      patch,
+      patch: snapshot.patch,
       revset: displayCommand(diffSource),
       vcs: diffSource.vcs,
       commentsEnabled: diffSource.commentsEnabled,
       expandable: diffSource.endpoints !== null,
-      fileHashes,
-      viewed,
-      commentSyntaxes,
+      fileHashes: snapshot.fileHashes,
+      viewed: snapshot.viewed,
+      commentSyntaxes: snapshot.commentSyntaxes,
+      scores: snapshot.scores,
+      scoring: await scoring.snapshot(snapshot.hunks),
     } satisfies DiffResponse)
   })
 
@@ -237,44 +272,43 @@ export async function startServer(opts: {
   })
 
   app.post('/api/comment', zValidator('json', commentRequestSchema), async (c) => {
-    const { file, afterLine, text } = c.req.valid('json')
-    const parsed = parseAgentQuestion(text)
-    const storedText = serializeNewReviewBody(text)
+    const { file, afterLine, text, kind } = c.req.valid('json')
     return withReviewMutation(async () => {
-      if (!parsed) {
-        const inserted = await insertComment(cwd, file, afterLine, storedText)
-        questions.shiftAfter(file, afterLine, inserted.insertedLineCount)
+      assertCommentsEnabled()
+      await assertSafeReviewFile(file)
+      if (kind === 'comment') {
+        await insertComment(cwd, file, afterLine, serializeNewReviewBody(text, kind))
         publishReviewChange({ reason: 'commented', file, line: afterLine })
         return c.json({ ok: true } satisfies CommentResponse)
       }
 
-      // Read context before insertion so the claimed excerpt contains source,
-      // not the newly inserted <review> block. Parsing first also ensures an
-      // invalid empty backend mention cannot mutate the working copy.
+      // Read context before insertion so the agent sees source, not the new
+      // review block. Validation also happens before mutating the file.
+      const { backend, question, body } = serializeEmbeddedQuestion(text)
       const context = await getQuestionContext(cwd, file, afterLine)
-      const inserted = await insertComment(cwd, file, afterLine, storedText)
-      questions.shiftAfter(file, afterLine, inserted.insertedLineCount)
-      const job = questions.enqueue({
+      const inserted = await insertComment(cwd, file, afterLine, body)
+      const managedQuestion = buildManagedQuestion({
         threadId: inserted.threadId,
-        backend: parsed.backend,
+        backend,
         file,
         line: afterLine,
-        question: parsed.question,
-        messages: [{ role: 'user', content: parsed.question }],
+        question,
+        messages: [{ role: 'user', content: question }],
         ...context,
         commentOpenLine: inserted.openLine,
       })
+      const id = agentReviews.start(managedQuestion)
       publishReviewChange({
         reason: 'queued',
         file,
         line: afterLine,
-        id: job.id,
-        backend: job.backend,
+        id,
+        backend,
         state: 'queued',
       })
       return c.json({
         ok: true,
-        question: { id: job.id, backend: job.backend, state: 'queued' },
+        question: { id, backend, state: 'queued' },
       } satisfies CommentResponse)
     })
   })
@@ -288,15 +322,18 @@ export async function startServer(opts: {
       if (!followUp) throw new Error('A follow-up message cannot be empty')
 
       return withReviewMutation(async () => {
+        assertCommentsEnabled()
+        await assertSafeReviewFile(file)
         const current = await readComment(cwd, file, line)
-        const currentThread = parseReviewThread(
-          current.text.split('\n'),
-          BARE_COMMENT,
-          '',
-          current.threadId,
-        )
+        const currentThread = parseStoredReviewThread(current.text, current.threadId)
         if (currentThread.kind !== 'question') {
           throw new Error('This review thread is not an agent question')
+        }
+        if (!currentThread.threadId) {
+          throw new Error('This review thread is not a Skepsis-managed question')
+        }
+        if (!hasSerializedQuestionMarker(current.text)) {
+          throw new Error('This review thread cannot accept agent follow-ups')
         }
         if (threadId && currentThread.threadId !== threadId) {
           throw new Error('The review thread moved; refresh and try again')
@@ -306,12 +343,7 @@ export async function startServer(opts: {
         }
 
         const nextBody = appendQuestionFollowUp(current.text, followUp, current.threadId)
-        const nextThread = parseReviewThread(
-          nextBody.split('\n'),
-          BARE_COMMENT,
-          '',
-          current.threadId,
-        )
+        const nextThread = parseStoredReviewThread(nextBody, current.threadId)
         if (nextThread.kind !== 'question' || nextThread.status !== 'pending') {
           throw new Error('Could not serialize the follow-up thread')
         }
@@ -322,35 +354,30 @@ export async function startServer(opts: {
           start: line,
           end: current.closeLine,
         })
-        const appended = await appendComment(
-          cwd,
-          file,
-          line,
-          nextBody.slice(current.text.length),
+        await appendComment(cwd, file, line, nextBody.slice(current.text.length))
+        const id = agentReviews.start(
+          buildManagedQuestion({
+            threadId: nextThread.threadId,
+            backend: currentThread.backend,
+            file,
+            line: line - 1,
+            question: followUp,
+            messages: nextThread.messages,
+            ...context,
+            commentOpenLine: line,
+          }),
         )
-        questions.cancelAtComment(file, line)
-        questions.shiftAfter(file, appended.previousCloseLine, appended.insertedLineCount)
-        const job = questions.enqueue({
-          threadId: nextThread.threadId,
-          backend: currentThread.backend,
-          file,
-          line: line - 1,
-          question: followUp,
-          messages: nextThread.messages,
-          ...context,
-          commentOpenLine: line,
-        })
         publishReviewChange({
           reason: 'queued',
           file,
           line: line - 1,
-          id: job.id,
-          backend: job.backend,
+          id,
+          backend: currentThread.backend,
           state: 'queued',
         })
         return c.json({
           ok: true,
-          question: { id: job.id, backend: job.backend, state: 'queued' },
+          question: { id, backend: currentThread.backend, state: 'queued' },
         } satisfies CommentResponse)
       })
     },
@@ -359,116 +386,19 @@ export async function startServer(opts: {
   app.delete('/api/comment', zValidator('json', commentDeleteSchema), async (c) => {
     const { file, line, threadId } = c.req.valid('json')
     return withReviewMutation(async () => {
-      if (threadId) {
-        const current = await readComment(cwd, file, line)
-        const thread = parseReviewThread(
-          current.text.split('\n'),
-          BARE_COMMENT,
-          '',
-          current.threadId,
-        )
-        if (thread.threadId !== threadId) {
-          throw new Error('The review thread moved; refresh and try again')
-        }
+      assertCommentsEnabled()
+      await assertSafeReviewFile(file)
+      const current = await readComment(cwd, file, line)
+      const thread = parseStoredReviewThread(current.text, current.threadId)
+      if (threadId && thread.threadId !== threadId) {
+        throw new Error('The review thread moved; refresh and try again')
       }
-      const removed = await removeComment(cwd, file, line)
-      questions.cancelAtComment(file, line)
-      questions.shiftAfter(
-        file,
-        line + removed.removedLineCount - 1,
-        -removed.removedLineCount,
-      )
+      if (thread.threadId) agentReviews.abortThread(thread.threadId)
+      await removeComment(cwd, file, line)
       publishReviewChange({ reason: 'resolved', file, line })
       return c.json({ ok: true } satisfies OkResponse)
     })
   })
-
-  app.post(
-    '/api/questions/claim',
-    zValidator('json', questionClaimRequestSchema),
-    async (c) => {
-      const err = unauthorized(c.req.header('authorization'))
-      if (err) return c.json(err satisfies ErrorResponse, 401)
-      const { backend, worker } = c.req.valid('json')
-      return withReviewMutation(() =>
-        c.json({
-          question: questions.claim(backend, worker),
-        } satisfies QuestionClaimResponse),
-      )
-    },
-  )
-
-  app.post(
-    '/api/questions/:id/answer',
-    zValidator('json', questionAnswerRequestSchema),
-    async (c) => {
-      const err = unauthorized(c.req.header('authorization'))
-      if (err) return c.json(err satisfies ErrorResponse, 401)
-      const { leaseId, answer } = c.req.valid('json')
-      if (!answer.trim()) throw new Error('An answer cannot be empty')
-      return withReviewMutation(async () => {
-        const job = questions.getClaimed(c.req.param('id'), leaseId)
-        await assertThreadIdentity(job.file, job.commentOpenLine, job.threadId)
-        const appended = await appendComment(
-          cwd,
-          job.file,
-          job.commentOpenLine,
-          questionAnswerSuffix(answer),
-        )
-        questions.shiftAfter(
-          job.file,
-          appended.previousCloseLine,
-          appended.insertedLineCount,
-        )
-        questions.markAnswered(job.id, answer)
-        publishReviewChange({
-          reason: 'answered',
-          file: job.file,
-          line: job.line,
-          id: job.id,
-          backend: job.backend,
-          state: 'answered',
-        })
-        return c.json({ ok: true } satisfies OkResponse)
-      })
-    },
-  )
-
-  app.post(
-    '/api/questions/:id/fail',
-    zValidator('json', questionFailRequestSchema),
-    async (c) => {
-      const err = unauthorized(c.req.header('authorization'))
-      if (err) return c.json(err satisfies ErrorResponse, 401)
-      const { leaseId, error } = c.req.valid('json')
-      if (!error.trim()) throw new Error('A failure message cannot be empty')
-      return withReviewMutation(async () => {
-        const job = questions.getClaimed(c.req.param('id'), leaseId)
-        await assertThreadIdentity(job.file, job.commentOpenLine, job.threadId)
-        const appended = await appendComment(
-          cwd,
-          job.file,
-          job.commentOpenLine,
-          questionFailureSuffix(error),
-        )
-        questions.shiftAfter(
-          job.file,
-          appended.previousCloseLine,
-          appended.insertedLineCount,
-        )
-        questions.markFailed(job.id, error)
-        publishReviewChange({
-          reason: 'failed',
-          file: job.file,
-          line: job.line,
-          id: job.id,
-          backend: job.backend,
-          state: 'failed',
-        })
-        return c.json({ ok: true } satisfies OkResponse)
-      })
-    },
-  )
 
   app.get('/api/theme', async (c) => {
     return c.json({ theme: await loadTheme() } satisfies ThemeResponse)
@@ -515,12 +445,23 @@ export async function startServer(opts: {
         console.info(`skepsis on ${url} (${displayCommand(diffSource)})`)
         resolve({
           port: assignedPort,
-          close: () => {
-            void clearServerInfo(cwd, { url, token: serverToken })
-            server.close()
+          close: async () => {
+            await scoring.close()
+            await agentReviews.close()
+            await runtime.close()
+            closeReviewEventStreams()
+            await reviewMutationTail.catch(() => undefined)
+            await clearServerInfo(cwd, { url, token: serverToken })
+            await new Promise<void>((resolveClose, rejectClose) => {
+              server.close((error) => (error ? rejectClose(error) : resolveClose()))
+            })
           },
         })
       } catch (error) {
+        closeReviewEventStreams()
+        await scoring.close().catch(() => {})
+        await agentReviews.close().catch(() => {})
+        await runtime.close().catch(() => {})
         server.close()
         reject(error)
       }

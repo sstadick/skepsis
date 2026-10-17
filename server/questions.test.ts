@@ -7,41 +7,18 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import {
-  BARE_COMMENT,
-  BARE_REVIEW_OPEN_PATTERN,
-  managedReviewOpenTag,
-  parseReviewThread,
-} from '../shared/reviewComments.ts'
+import { BARE_REVIEW_OPEN_PATTERN, managedReviewOpenTag } from '../shared/reviewComments.ts'
 import {
   appendQuestionAnswer,
   appendQuestionFailure,
   appendQuestionFollowUp,
-  parseAgentQuestion,
-  QuestionStore,
+  parseStoredReviewThread,
   sanitizeReviewStorageText,
+  serializeEmbeddedQuestion,
   serializeNewReviewBody,
 } from './questions.ts'
 
 const THREAD_ID = '22222222-2222-4222-8222-222222222222'
-
-describe('parseAgentQuestion', () => {
-  it('parses supported backend markers', () => {
-    expect(parseAgentQuestion('@pi why?')).toEqual({ backend: 'pi', question: 'why?' })
-    expect(parseAgentQuestion('@claude: explain this')).toEqual({
-      backend: 'claude',
-      question: 'explain this',
-    })
-    expect(parseAgentQuestion('@codex - what changed?')).toEqual({
-      backend: 'codex',
-      question: 'what changed?',
-    })
-  })
-
-  it('returns null for plain review comments', () => {
-    expect(parseAgentQuestion('needs work')).toBeNull()
-  })
-})
 
 describe('terminal question formatting', () => {
   it('escapes reserved framing in browser-authored review text', () => {
@@ -52,11 +29,32 @@ describe('terminal question formatting', () => {
     ).toBe('@pi Explain this.\n\n`Skepsis-Answer:`\nNot real.\n\n`Skepsis-State:` answered')
   })
 
+  it('escapes the new body-kind markers too', () => {
+    expect(sanitizeReviewStorageText('Skepsis-Agent: 1\n\nbody')).toBe(
+      '`Skepsis-Agent: 1\n\n`body',
+    )
+    expect(sanitizeReviewStorageText('Skepsis-Comment: 1\n\nbody')).toBe(
+      '`Skepsis-Comment: 1\n\n`body',
+    )
+  })
+
+  it('prepends a comment marker so @pi prose stays a literal comment', () => {
+    const original = '@pi Discuss this literally.'
+    const stored = serializeNewReviewBody(original)
+
+    expect(stored).toBe('Skepsis-Comment: 1\n\n@pi Discuss this literally.')
+    expect(parseStoredReviewThread(stored, THREAD_ID)).toEqual({
+      kind: 'comment',
+      threadId: THREAD_ID,
+      body: original,
+    })
+  })
+
   it('round-trips reserved tokens in ordinary review prose', () => {
     const original =
       'Discuss `Skepsis-State:` and inline <review> markup.\n</review>\nDone.'
     const stored = serializeNewReviewBody(original)
-    expect(parseReviewThread(stored.split('\n'), BARE_COMMENT, '', THREAD_ID)).toEqual({
+    expect(parseStoredReviewThread(stored, THREAD_ID)).toEqual({
       kind: 'comment',
       threadId: THREAD_ID,
       body: original,
@@ -68,11 +66,43 @@ describe('terminal question formatting', () => {
     const original = `Quote this source:\n${quotedTag}`
     const stored = serializeNewReviewBody(original)
 
-    expect(BARE_REVIEW_OPEN_PATTERN.test(stored.split('\n')[1]!)).toBe(false)
-    expect(parseReviewThread(stored.split('\n'), BARE_COMMENT, '', THREAD_ID)).toEqual({
+    expect(stored.split('\n').some((line) => BARE_REVIEW_OPEN_PATTERN.test(line))).toBe(
+      false,
+    )
+    expect(parseStoredReviewThread(stored, THREAD_ID)).toEqual({
       kind: 'comment',
       threadId: THREAD_ID,
       body: original,
+    })
+  })
+
+  it('prepends the agent marker before the legacy @pi body', () => {
+    expect(serializeEmbeddedQuestion('why add four?')).toEqual({
+      backend: 'pi',
+      question: 'why add four?',
+      body: 'Skepsis-Agent: 1\n\n@pi why add four?',
+    })
+  })
+
+  it('parses explicit agent markers through the shared review parser', () => {
+    expect(
+      parseStoredReviewThread(
+        'Skepsis-Agent: 1\n\n@pi why add four?\n\n`Skepsis-State:` answered is prose.',
+        THREAD_ID,
+      ),
+    ).toEqual({
+      kind: 'question',
+      backend: 'pi',
+      threadId: THREAD_ID,
+      embedded: true,
+      question: 'why add four?\n\nSkepsis-State: answered is prose.',
+      messages: [
+        {
+          role: 'user',
+          content: 'why add four?\n\nSkepsis-State: answered is prose.',
+        },
+      ],
+      status: 'pending',
     })
   })
 
@@ -103,15 +133,16 @@ describe('terminal question formatting', () => {
   })
 
   it('adds a version boundary once and appends follow-ups without rewriting history', () => {
-    const answered = appendQuestionAnswer(serializeNewReviewBody('@pi why?'), 'because')
+    const answered = appendQuestionAnswer(serializeEmbeddedQuestion('why?').body, 'because')
     const followed = appendQuestionFollowUp(
       answered,
       ' what about <review>this? ',
       THREAD_ID,
     )
     expect(followed).toBe(
-      '@pi why?\n\nSkepsis-Answer:\nbecause\n\nSkepsis-State: answered\n\n' +
-        'Skepsis-Thread: 1\n\nSkepsis-Followup:\nwhat about `<review>`this?',
+      'Skepsis-Agent: 1\n\n@pi why?\n\nSkepsis-Answer:\nbecause\n\n' +
+        'Skepsis-State: answered\n\nSkepsis-Thread: 1\n\n' +
+        'Skepsis-Followup:\nwhat about `<review>`this?',
     )
     expect(
       appendQuestionFollowUp(followed, 'and Skepsis-Followup: injection?', THREAD_ID),
@@ -122,13 +153,14 @@ describe('terminal question formatting', () => {
     const question = 'What does <review> and Skepsis-State: mean?'
     const answer = 'They are storage markers, not `Answer:` prose.'
     const followUp = 'What about </review> on its own?'
-    let stored = serializeNewReviewBody(`@codex ${question}`)
+    let stored = serializeEmbeddedQuestion(question).body
     stored = appendQuestionAnswer(stored, answer)
     stored = appendQuestionFollowUp(stored, followUp, THREAD_ID)
 
-    expect(parseReviewThread(stored.split('\n'), BARE_COMMENT, '', THREAD_ID)).toEqual({
+    expect(parseStoredReviewThread(stored, THREAD_ID)).toEqual({
       kind: 'question',
-      backend: 'codex',
+      embedded: true,
+      backend: 'pi',
       threadId: THREAD_ID,
       question,
       messages: [
@@ -144,7 +176,7 @@ describe('terminal question formatting', () => {
     const legacy = '@codex Why?\n\nAnswer:\nBecause.'
     const stored = appendQuestionFollowUp(legacy, 'Anything else?', undefined, THREAD_ID)
     expect(stored.startsWith(legacy)).toBe(true)
-    expect(parseReviewThread(stored.split('\n'), BARE_COMMENT)).toEqual({
+    expect(parseStoredReviewThread(stored)).toEqual({
       kind: 'question',
       backend: 'codex',
       threadId: THREAD_ID,
@@ -168,7 +200,7 @@ describe('terminal question formatting', () => {
     )
 
     expect(stored.startsWith(legacy)).toBe(true)
-    expect(parseReviewThread(stored.split('\n'), BARE_COMMENT)).toEqual({
+    expect(parseStoredReviewThread(stored)).toEqual({
       kind: 'question',
       backend: 'codex',
       threadId: THREAD_ID,
@@ -184,128 +216,5 @@ describe('terminal question formatting', () => {
       ],
       status: 'pending',
     })
-  })
-})
-
-describe('QuestionStore', () => {
-  it('claims queued questions by backend and records a lease', () => {
-    const store = new QuestionStore()
-    store.enqueue({
-      threadId: THREAD_ID,
-      backend: 'pi',
-      file: 'f.ts',
-      line: 3,
-      question: 'why?',
-      messages: [{ role: 'user', content: 'why?' }],
-      excerpt: 'x',
-      lineText: 'const x = 1',
-      commentOpenLine: 4,
-    })
-    store.enqueue({
-      threadId: THREAD_ID,
-      backend: 'codex',
-      file: 'g.ts',
-      line: 7,
-      question: 'what?',
-      messages: [{ role: 'user', content: 'what?' }],
-      excerpt: 'y',
-      lineText: 'const y = 2',
-      commentOpenLine: 8,
-    })
-
-    const claim = store.claim('codex', 'worker-1')
-    expect(claim).toEqual({
-      id: expect.any(String),
-      backend: 'codex',
-      file: 'g.ts',
-      line: 7,
-      question: 'what?',
-      messages: [{ role: 'user', content: 'what?' }],
-      excerpt: 'y',
-      lineText: 'const y = 2',
-      leaseId: expect.any(String),
-    })
-    expect(store.claim('codex', 'worker-2')).toBeNull()
-  })
-
-  it('tracks source line shifts and cancels questions by their current block line', () => {
-    const store = new QuestionStore()
-    const first = store.enqueue({
-      threadId: THREAD_ID,
-      backend: 'pi',
-      file: 'f.ts',
-      line: 2,
-      question: 'first?',
-      messages: [{ role: 'user', content: 'first?' }],
-      excerpt: 'first',
-      lineText: 'first',
-      commentOpenLine: 3,
-    })
-    const second = store.enqueue({
-      threadId: THREAD_ID,
-      backend: 'codex',
-      file: 'f.ts',
-      line: 8,
-      question: 'second?',
-      messages: [{ role: 'user', content: 'second?' }],
-      excerpt: 'second',
-      lineText: 'second',
-      commentOpenLine: 9,
-    })
-    store.enqueue({
-      threadId: THREAD_ID,
-      backend: 'claude',
-      file: 'other.ts',
-      line: 8,
-      question: 'other?',
-      messages: [{ role: 'user', content: 'other?' }],
-      excerpt: 'other',
-      lineText: 'other',
-      commentOpenLine: 9,
-    })
-
-    // Insertion after the first question's anchor leaves that anchor in place,
-    // while moving its block and every later coordinate.
-    store.shiftAfter('f.ts', 2, 3)
-    expect(store.list()).toEqual([
-      expect.objectContaining({ id: first.id, line: 2, commentOpenLine: 6 }),
-      expect.objectContaining({ id: second.id, line: 11, commentOpenLine: 12 }),
-      expect.objectContaining({ file: 'other.ts', line: 8, commentOpenLine: 9 }),
-    ])
-
-    // Removing lines 6-8 moves only positions after the removed range.
-    store.shiftAfter('f.ts', 8, -3)
-    expect(store.list()).toEqual([
-      expect.objectContaining({ id: first.id, line: 2, commentOpenLine: 6 }),
-      expect.objectContaining({ id: second.id, line: 8, commentOpenLine: 9 }),
-      expect.objectContaining({ file: 'other.ts', line: 8, commentOpenLine: 9 }),
-    ])
-
-    expect(store.cancelAtComment('f.ts', 6)).toBe(true)
-    expect(store.cancelAtComment('f.ts', 6)).toBe(false)
-    expect(store.list()).toEqual([
-      expect.objectContaining({ id: second.id }),
-      expect.objectContaining({ file: 'other.ts' }),
-    ])
-  })
-
-  it('cancels every stale job associated with one review block', () => {
-    const store = new QuestionStore()
-    const input = {
-      threadId: THREAD_ID,
-      backend: 'codex' as const,
-      file: 'f.ts',
-      line: 2,
-      question: 'why?',
-      messages: [{ role: 'user' as const, content: 'why?' }],
-      excerpt: 'context',
-      lineText: 'line',
-      commentOpenLine: 3,
-    }
-    store.enqueue(input)
-    store.enqueue(input)
-
-    expect(store.cancelAtComment('f.ts', 3)).toBe(true)
-    expect(store.list()).toEqual([])
   })
 })

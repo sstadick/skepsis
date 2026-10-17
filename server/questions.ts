@@ -7,55 +7,50 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { lstat, readFile, realpath } from 'node:fs/promises'
+import { isAbsolute, relative, resolve } from 'node:path'
 import {
+  BARE_COMMENT,
+  parseReviewThread,
   REVIEW_STORAGE_RESERVED_TOKENS,
+  SKEPSIS_AGENT_MARKER,
   SKEPSIS_ANSWER_SEPARATOR,
   SKEPSIS_ANSWER_STATE,
+  SKEPSIS_COMMENT_MARKER,
   SKEPSIS_FAILURE_SEPARATOR,
   SKEPSIS_FAILURE_STATE,
   SKEPSIS_FOLLOWUP_SEPARATOR,
   SKEPSIS_THREAD_ID_PREFIX,
   SKEPSIS_THREAD_MARKER,
+  splitSerializedReviewBody,
+  type ReviewThreadContent,
 } from '../shared/reviewComments.ts'
-import type {
-  AgentBackend,
-  QuestionClaimResponse,
-  QuestionConversationMessage,
-  QuestionJob,
-} from '../shared/types.ts'
+import type { AgentBackend, ReviewBodyKind } from '../shared/types.ts'
+export const EMBEDDED_AGENT_BACKEND: AgentBackend = 'pi'
 
-const QUESTION_PREFIX = /^\s*@(pi|claude|codex)\b[:\s-]*/i
 const STORAGE_RESERVED_PATTERN = new RegExp(
-  REVIEW_STORAGE_RESERVED_TOKENS.map((token) =>
-    token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
-  ).join('|'),
+  [...new Set(REVIEW_STORAGE_RESERVED_TOKENS)]
+    .map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('|'),
   'g',
 )
 const THREAD_EXTENSION_PATTERN =
   /\n\nSkepsis-Thread: 1(?:; id=[0-9a-fA-F-]{36})?\n\nSkepsis-Followup:\n/
-
-export interface ParsedAgentQuestion {
-  backend: AgentBackend
-  question: string
-}
 
 export interface QuestionContext {
   lineText: string
   excerpt: string
 }
 
-export interface EnqueueQuestionInput {
-  threadId: string
-  backend: AgentBackend
-  file: string
-  line: number
-  question: string
-  excerpt: string
-  lineText: string
-  commentOpenLine: number
-  messages: QuestionConversationMessage[]
+export function hasSerializedQuestionMarker(text: string): boolean {
+  return splitSerializedReviewBody(text).marker === 'question'
+}
+
+export function parseStoredReviewThread(
+  text: string,
+  managedThreadId?: string,
+): ReviewThreadContent {
+  return parseReviewThread(text.split('\n'), BARE_COMMENT, '', managedThreadId)
 }
 
 /**
@@ -68,8 +63,36 @@ export function sanitizeReviewStorageText(text: string): string {
 }
 
 /** Encode a new managed review body; its version and UUID live on the open tag. */
-export function serializeNewReviewBody(text: string): string {
-  return sanitizeReviewStorageText(text)
+export function serializeNewReviewBody(
+  text: string,
+  kind: ReviewBodyKind = 'comment',
+): string {
+  const prefix = kind === 'comment' ? SKEPSIS_COMMENT_MARKER : ''
+  return `${prefix}${sanitizeReviewStorageText(text)}`
+}
+
+export function normalizeQuestionText(text: string): string {
+  const question = text.trim()
+  if (!question) throw new Error('A question cannot be empty')
+  return question
+}
+
+export function serializeEmbeddedQuestion(text: string): {
+  backend: AgentBackend
+  question: string
+  body: string
+} {
+  const question = normalizeQuestionText(text)
+  const [firstLine = '', ...rest] = question.split('\n')
+  return {
+    backend: EMBEDDED_AGENT_BACKEND,
+    question,
+    body:
+      SKEPSIS_AGENT_MARKER +
+      sanitizeReviewStorageText(
+        [`@${EMBEDDED_AGENT_BACKEND} ${firstLine}`, ...rest].join('\n'),
+      ),
+  }
 }
 
 export function appendQuestionAnswer(text: string, answer: string): string {
@@ -108,18 +131,25 @@ export function appendQuestionFollowUp(
   )}`
 }
 
-export function parseAgentQuestion(text: string): ParsedAgentQuestion | null {
-  const lines = text.trim().split('\n')
-  const first = lines[0]
-  if (!first) return null
-  const match = first.match(QUESTION_PREFIX)
-  if (!match) return null
-  const backend = match[1]!.toLowerCase() as AgentBackend
-  const question = [first.slice(match[0].length), ...lines.slice(1)].join('\n').trim()
-  if (!question) {
-    throw new Error(`@${backend} review comments need a question after the backend marker`)
+export async function resolveSafeReviewFilePath(
+  cwd: string,
+  file: string,
+): Promise<string> {
+  const cwdReal = await realpath(cwd)
+  const path = resolve(cwd, file)
+  const stat = await lstat(path).catch(() => null)
+  if (!stat || !stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`Unsafe review file path: ${file}`)
   }
-  return { backend, question }
+
+  const resolved = await realpath(path).catch(() => null)
+  if (!resolved) throw new Error(`Unsafe review file path: ${file}`)
+
+  const rel = relative(cwdReal, resolved)
+  if (rel === '..' || rel.startsWith('../') || rel.startsWith('..\\') || isAbsolute(rel)) {
+    throw new Error(`Unsafe review file path: ${file}`)
+  }
+  return resolved
 }
 
 export async function getQuestionContext(
@@ -128,7 +158,7 @@ export async function getQuestionContext(
   line: number,
   omitLines?: { start: number; end: number },
 ): Promise<QuestionContext> {
-  const content = await readFile(join(cwd, file), 'utf-8')
+  const content = await readFile(await resolveSafeReviewFilePath(cwd, file), 'utf-8')
   const lines = content.split('\n')
   if (line < 1 || line > lines.length) {
     throw new Error(`Line ${line} out of range (file has ${lines.length} lines)`)
@@ -153,110 +183,5 @@ export async function getQuestionContext(
   return {
     lineText: lines[line - 1] ?? '',
     excerpt: excerptLines.join('\n'),
-  }
-}
-
-function publicQuestion(job: QuestionJob): QuestionClaimResponse['question'] {
-  return {
-    id: job.id,
-    backend: job.backend,
-    file: job.file,
-    line: job.line,
-    question: job.question,
-    messages: job.messages,
-    excerpt: job.excerpt,
-    lineText: job.lineText,
-    leaseId: job.leaseId!,
-  }
-}
-
-export class QuestionStore {
-  private readonly jobs = new Map<string, QuestionJob>()
-
-  enqueue(input: EnqueueQuestionInput): QuestionJob {
-    const job: QuestionJob = {
-      id: randomUUID(),
-      threadId: input.threadId,
-      backend: input.backend,
-      file: input.file,
-      line: input.line,
-      question: input.question,
-      messages: input.messages,
-      excerpt: input.excerpt,
-      lineText: input.lineText,
-      commentOpenLine: input.commentOpenLine,
-      state: 'queued',
-      createdAt: Date.now(),
-    }
-    this.jobs.set(job.id, job)
-    return job
-  }
-
-  claim(
-    backend: AgentBackend | undefined,
-    worker: string | undefined,
-  ): QuestionClaimResponse['question'] {
-    for (const job of this.jobs.values()) {
-      if (job.state !== 'queued') continue
-      if (backend && job.backend !== backend) continue
-      job.state = 'claimed'
-      job.claimedAt = Date.now()
-      job.claimedBy = worker
-      job.leaseId = randomUUID()
-      return publicQuestion(job)
-    }
-    return null
-  }
-
-  getClaimed(id: string, leaseId: string): QuestionJob {
-    const job = this.jobs.get(id)
-    if (!job) throw new Error(`No such question: ${id}`)
-    if (job.state !== 'claimed') {
-      throw new Error(`Question ${id} is ${job.state}, not claimable`)
-    }
-    if (job.leaseId !== leaseId) throw new Error(`Lease mismatch for question ${id}`)
-    return job
-  }
-
-  markAnswered(id: string, answer: string): void {
-    const job = this.jobs.get(id)
-    if (!job) throw new Error(`No such question: ${id}`)
-    job.state = 'answered'
-    job.answer = answer
-  }
-
-  markFailed(id: string, error: string): void {
-    const job = this.jobs.get(id)
-    if (!job) throw new Error(`No such question: ${id}`)
-    job.state = 'failed'
-    job.error = error
-  }
-
-  /**
-   * Keep source coordinates stable after a file edit. Both coordinates refer
-   * to the pre-edit file; anything strictly after `line` moves by `delta`.
-   */
-  shiftAfter(file: string, line: number, delta: number): void {
-    if (delta === 0) return
-    for (const job of this.jobs.values()) {
-      if (job.file !== file) continue
-      if (job.line > line) job.line += delta
-      if (job.commentOpenLine > line) job.commentOpenLine += delta
-    }
-  }
-
-  /** Remove every question whose review block begins at this current file line. */
-  cancelAtComment(file: string, commentOpenLine: number): boolean {
-    let removed = false
-    for (const [id, job] of this.jobs) {
-      if (job.file !== file || job.commentOpenLine !== commentOpenLine) continue
-      this.jobs.delete(id)
-      removed = true
-    }
-    return removed
-  }
-
-  list(): QuestionJob[] {
-    return structuredClone([...this.jobs.values()])
   }
 }

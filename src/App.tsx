@@ -42,10 +42,12 @@ import type {
   DiffResponse,
   ErrorResponse,
   FileContentsResponse,
+  FileHashes,
+  OkResponse,
+  ScoreTriggerResponse,
   ThemeMode,
   ThemeResponse,
   ViewedMap,
-  FileHashes,
 } from '../shared/types.ts'
 import {
   BARE_COMMENT,
@@ -56,6 +58,25 @@ import {
   parseReviewThread,
   reviewTagRegex,
 } from '../shared/reviewComments.ts'
+import {
+  beginComposing,
+  emptyReviewComposerDraft,
+  updateComposerDraft,
+  updateComposerFocus,
+  updateFollowUpDrafts,
+  updateFollowUpFocus,
+  type ComposerState,
+  type FollowUpDraftState,
+} from './draftState.ts'
+import { ReviewComposer, ReviewThreadCard, type ReviewComposerSubmit } from './reviewUi.tsx'
+import { ScoreControls } from './scoreControls.tsx'
+import {
+  createFileScoreDecorations,
+  normalizeScoringSummary,
+  SCORE_GUTTER_CSS,
+  tagScoreLines,
+} from './score.ts'
+import { useRefreshClearedError } from './useRefreshClearedError.ts'
 
 const queryClient = new QueryClient()
 
@@ -344,40 +365,6 @@ function reviewRanges(
   )
 }
 
-type ButtonProps = {
-  variant?: 'primary' | 'secondary'
-  onClick: () => void
-  disabled?: boolean
-  ariaLabel?: string
-  children: React.ReactNode
-}
-
-function Button({
-  variant = 'secondary',
-  onClick,
-  disabled,
-  ariaLabel,
-  children,
-}: ButtonProps) {
-  return (
-    <button
-      type="button"
-      className={`btn btn-${variant}`}
-      onClick={onClick}
-      disabled={disabled}
-      aria-label={ariaLabel}
-    >
-      {children}
-    </button>
-  )
-}
-
-const BACKEND_LABELS = {
-  pi: 'Pi',
-  claude: 'Claude',
-  codex: 'Codex',
-} as const
-
 function reviewThreadKey(
   file: string,
   startLine: number,
@@ -389,239 +376,6 @@ function reviewThreadKey(
   return thread.threadId
     ? JSON.stringify(['thread', file, thread.threadId])
     : JSON.stringify(['legacy', file, startLine])
-}
-
-function ReviewThread({
-  thread,
-  onResolve,
-  onFollowUp,
-  followUpDraft,
-  onFollowUpDraftChange,
-  resolving,
-  followingUp,
-  followUpError,
-}: {
-  thread: ReviewThreadContent
-  onResolve: () => void
-  onFollowUp: (text: string) => void
-  followUpDraft: string
-  onFollowUpDraftChange: (text: string) => void
-  resolving: boolean
-  followingUp: boolean
-  followUpError: string | null
-}) {
-  const isQuestion = thread.kind === 'question'
-  const backend = isQuestion ? BACKEND_LABELS[thread.backend] : null
-  const status = isQuestion ? thread.status : null
-  const statusLabel =
-    status === 'answered' ? 'Answered' : status === 'failed' ? 'Failed' : 'Pending'
-  const initialBody = isQuestion ? thread.messages[0]!.content : thread.body
-  const replies = isQuestion ? thread.messages.slice(1) : []
-
-  return (
-    <article
-      className="review-thread"
-      aria-label={isQuestion ? `Review question for ${backend}` : 'Review comment'}
-    >
-      <div className="review-thread-entry">
-        <header className="review-thread-header">
-          <div className="review-thread-byline">
-            {isQuestion ? (
-              <>
-                <span className="review-thread-kind">Question for</span>
-                <span className="review-thread-backend">{backend}</span>
-                <span
-                  className={`review-thread-status review-thread-status-${status}`}
-                  role="status"
-                  aria-live="polite"
-                  aria-atomic="true"
-                >
-                  {statusLabel}
-                </span>
-              </>
-            ) : (
-              <span className="review-thread-kind">Review comment</span>
-            )}
-          </div>
-          <Button
-            onClick={onResolve}
-            disabled={resolving}
-            ariaLabel={
-              isQuestion
-                ? `Resolve review question for ${backend}`
-                : 'Resolve review comment'
-            }
-          >
-            {resolving ? 'Resolving…' : 'Resolve'}
-          </Button>
-        </header>
-        <div className="review-thread-body">{initialBody}</div>
-      </div>
-      {replies.map((message, index) => (
-        <div
-          // Thread messages are append-only, so their source-order position is
-          // stable for the lifetime of the card.
-          // oxlint-disable-next-line react/no-array-index-key
-          key={`${message.role}-${index}`}
-          className={[
-            'review-thread-entry',
-            'review-thread-reply',
-            `review-thread-reply-${message.role}`,
-            message.role === 'assistant' ? `review-thread-reply-${message.outcome}` : '',
-          ]
-            .filter(Boolean)
-            .join(' ')}
-        >
-          <header className="review-thread-header">
-            <div className="review-thread-byline">
-              <span className="review-thread-backend">
-                {message.role === 'assistant' ? backend : 'You'}
-              </span>
-              <span className="review-thread-kind">
-                {message.role === 'assistant' ? message.outcome : 'follow-up'}
-              </span>
-            </div>
-          </header>
-          <div className="review-thread-body">{message.content}</div>
-        </div>
-      ))}
-      {isQuestion && status !== 'pending' && (
-        <ThreadFollowUpForm
-          backend={backend!}
-          text={followUpDraft}
-          onTextChange={onFollowUpDraftChange}
-          onSubmit={onFollowUp}
-          submitting={followingUp}
-          error={followUpError}
-        />
-      )}
-    </article>
-  )
-}
-
-function ThreadFollowUpForm({
-  backend,
-  text,
-  onTextChange,
-  onSubmit,
-  submitting,
-  error,
-}: {
-  backend: string
-  text: string
-  onTextChange: (text: string) => void
-  onSubmit: (text: string) => void
-  submitting: boolean
-  error: string | null
-}) {
-  const submit = () => {
-    const body = text.trim()
-    if (!body || submitting) return
-    onSubmit(body)
-  }
-
-  return (
-    <div
-      className="review-thread-entry review-thread-follow-up"
-      onClick={(event) => event.stopPropagation()}
-    >
-      <textarea
-        value={text}
-        onChange={(event) => onTextChange(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-            event.preventDefault()
-            submit()
-          }
-        }}
-        placeholder={`Follow up with ${backend}… (Cmd+Enter to send)`}
-        rows={3}
-        disabled={submitting}
-        aria-label={`Follow up with ${backend}`}
-      />
-      <div className="review-thread-follow-up-actions">
-        {error && <div className="comment-form-error">{error}</div>}
-        <Button variant="primary" disabled={!text.trim() || submitting} onClick={submit}>
-          {submitting ? 'Sending…' : 'Send follow-up'}
-        </Button>
-      </div>
-    </div>
-  )
-}
-
-// --- Comment form ---
-
-function CommentForm({
-  onSubmit,
-  onCancel,
-  submitting,
-  error,
-  syntax,
-}: {
-  onSubmit: (text: string) => void
-  onCancel: () => void
-  submitting: boolean
-  error: string | null
-  /** Comment syntax the inserted tags will use. Empty prefix: the format has
-   *  no comment syntax; null: unrecognized file type. Both insert bare. */
-  syntax: CommentSyntax | null
-}) {
-  const [text, setText] = useState('')
-  // useEffect instead of a function ref because the function ref didn't
-  // actually focus the textarea on open.
-  const ref = useRef<HTMLTextAreaElement>(null)
-  useEffect(() => {
-    ref.current?.focus()
-  }, [])
-
-  const submit = () => {
-    const body = text.trim()
-    if (!body || submitting) return
-    onSubmit(body)
-  }
-
-  return (
-    <div className="comment-form" onClick={(e) => e.stopPropagation()}>
-      <textarea
-        ref={ref}
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-            e.preventDefault()
-            submit()
-          }
-          if (e.key === 'Escape') onCancel()
-        }}
-        placeholder="Leave a review comment... (Cmd+Enter to submit)"
-        rows={3}
-        disabled={submitting}
-      />
-      <div className="comment-form-actions">
-        <div className="comment-form-note">
-          {syntax === null ? (
-            <>Comment marker: none (file type not recognized)</>
-          ) : syntax.prefix === '' ? (
-            <>Comment marker: none (plain text)</>
-          ) : (
-            <>
-              Comment marker:{' '}
-              <code>
-                {syntax.suffix ? `${syntax.prefix} ${syntax.suffix}` : syntax.prefix}
-              </code>
-            </>
-          )}
-        </div>
-        {error && <div className="comment-form-error">{error}</div>}
-        <Button onClick={onCancel} disabled={submitting}>
-          Cancel
-        </Button>
-        <Button variant="primary" disabled={!text.trim() || submitting} onClick={submit}>
-          Comment
-        </Button>
-      </div>
-    </div>
-  )
 }
 
 /* Tooltip for the header buttons, portaled to document.body so it paints over
@@ -842,6 +596,11 @@ function ProgressBar({
   fileHashes,
   viewed,
   onUnviewAll,
+  scoring,
+  triggerScoring,
+  cancelScoring,
+  triggerScoringPending,
+  cancelScoringPending,
   theme,
   onCycleTheme,
 }: {
@@ -849,6 +608,11 @@ function ProgressBar({
   fileHashes: FileHashes
   viewed: ViewedMap
   onUnviewAll: () => void
+  scoring: ReturnType<typeof normalizeScoringSummary>
+  triggerScoring: () => void
+  cancelScoring: () => void
+  triggerScoringPending: boolean
+  cancelScoringPending: boolean
   theme: ThemeMode
   onCycleTheme: () => void
 }) {
@@ -886,6 +650,13 @@ function ProgressBar({
           Clear
         </button>
       </Tip>
+      <ScoreControls
+        summary={scoring}
+        triggerPending={triggerScoringPending}
+        cancelPending={cancelScoringPending}
+        onTrigger={triggerScoring}
+        onCancel={cancelScoring}
+      />
       {/* The icon and tooltip show the current mode including "system": a
           toggle that hides the system state leaves a user who forced a theme
           long ago unable to see why the app ignores their OS setting. */}
@@ -940,7 +711,7 @@ const SHORTCUTS: [string, string][] = [
   ['e / E', 'Toggle collapse file / all files'],
   ['s', 'Toggle split mode (responsive / unified)'],
   ['t', 'Cycle theme (system / light / dark)'],
-  ['c', 'Comment on line'],
+  ['c', 'Open review composer on line'],
   ['Esc', 'Close / cancel'],
   ['?', 'Toggle this help'],
 ]
@@ -974,7 +745,8 @@ function CommentsModal({ onClose, vcs }: { onClose: () => void; vcs: 'jj' | 'git
   return (
     <Modal onClose={onClose}>
       <p>
-        Comments work by inserting lines into the code. This can only work if the{' '}
+        Review comments and agent questions work by writing local annotation lines into your
+        working files. This only works if the{' '}
         {vcs === 'jj' ? (
           <>
             revset includes <code>@</code>
@@ -982,19 +754,24 @@ function CommentsModal({ onClose, vcs }: { onClose: () => void; vcs: 'jj' | 'git
         ) : (
           'commit range includes the working copy'
         )}
-        . Otherwise, the inserted lines will land in{' '}
+        . Otherwise, the inserted lines land in{' '}
         {vcs === 'jj' ? <code>@</code> : 'the working copy'} but not in the diff being
         viewed.
       </p>
+      <p>
+        These annotations are not GitHub review comments, and Skepsis does not have a
+        Publish step. For GitHub, copy anything you want into the PR review and resolve
+        local annotations before committing.
+      </p>
       {vcs === 'jj' ? (
         <p>
-          The easiest way to get a diff with comments enabled is to run with the{' '}
-          <code>-f</code> flag to get a diff that starts at some revision and ends at{' '}
+          The easiest way to get local annotations enabled is to run with the{' '}
+          <code>-f</code> flag so the diff starts at some revision and ends at{' '}
           <code>@</code>.
         </p>
       ) : (
         <p>
-          The easiest way to get a diff with comments enabled is to run with <code>-f</code>{' '}
+          The easiest way to get local annotations enabled is to run with <code>-f</code>{' '}
           only (no <code>-t</code>), so the diff goes from a commit to the working tree.
         </p>
       )}
@@ -1013,10 +790,11 @@ function CommentsDisabledBanner({
     <div className="comments-disabled-banner">
       {vcs === 'jj' ? (
         <>
-          Comments are disabled because the revset does not include <code>@</code>.
+          Local review annotations are disabled because the revset does not include{' '}
+          <code>@</code>.
         </>
       ) : (
-        'Comments are disabled because the commit range does not end at the working copy.'
+        'Local review annotations are disabled because the commit range does not end at the working copy.'
       )}{' '}
       <a
         href="#"
@@ -1062,15 +840,16 @@ function DiffView() {
   // Files the user expanded via the header's expand-all-lines button: these are
   // re-parsed with whole-file context so every collapsed region is revealed.
   const [expandedFiles, setExpandedFiles] = useState<Record<string, boolean>>({})
-  const [composing, setComposing] = useState<{
-    file: string
-    line: number
-  } | null>(null)
+  // CodeView remounts items when score data or other rendered inputs change,
+  // so active composer state lives here rather than inside the annotation.
+  const [composing, setComposing] = useState<ComposerState | null>(null)
   // CodeView virtualizes annotations, so card-local state would disappear on
   // scroll or an SSE refresh. The initial question is stable across line shifts.
-  const [followUpDrafts, setFollowUpDrafts] = useState<Record<string, string>>({})
+  const [followUpDrafts, setFollowUpDrafts] = useState<Record<string, FollowUpDraftState>>(
+    {},
+  )
   const seededFromInitialLoad = useRef(false)
-  const { data, error, isLoading } = useQuery({
+  const { data, error, isLoading, dataUpdatedAt } = useQuery({
     queryKey: ['diff'],
     queryFn: () => apiFetch<DiffResponse>('/api/diff'),
   })
@@ -1078,6 +857,9 @@ function DiffView() {
   useEffect(() => {
     if (data?.revset) document.title = `skepsis | ${data.revset}`
   }, [data?.revset])
+
+  const scoring = normalizeScoringSummary(data?.scoring)
+  const scoreActionError = useRefreshClearedError(dataUpdatedAt)
 
   // Seed collapse state from the first successful fetch: viewed files start collapsed
   useEffect(() => {
@@ -1164,23 +946,47 @@ function DiffView() {
     onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
   })
 
+  const scoreTriggerMutation = useMutation({
+    mutationFn: () => apiFetch<ScoreTriggerResponse>('/api/score', { method: 'POST' }),
+    onMutate: () => scoreActionError.clear(),
+    onError: (err) => scoreActionError.set(err.message),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
+  })
+
+  const scoreCancelMutation = useMutation({
+    mutationFn: () => apiFetch<OkResponse>('/api/score', { method: 'DELETE' }),
+    onMutate: () => scoreActionError.clear(),
+    onError: (err) => scoreActionError.set(err.message),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
+  })
+
   const commentMutation = useMutation({
     mutationFn: ({
       file,
       afterLine,
       text,
+      kind,
     }: {
       file: string
       afterLine: number
       text: string
+      kind: ReviewComposerSubmit['kind']
     }) =>
       apiFetch('/api/comment', {
         method: 'POST',
-        body: { file, afterLine, text },
+        body: { file, afterLine, text, kind },
       }),
     onSuccess: () => setComposing(null),
     onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
   })
+
+  const startComposing = useCallback(
+    (file: string, line: number) => {
+      commentMutation.reset()
+      setComposing((previous) => beginComposing(previous, file, line))
+    },
+    [commentMutation],
+  )
 
   const followUpMutation = useMutation({
     mutationFn: ({
@@ -1342,6 +1148,14 @@ function DiffView() {
 
   const commentsEnabled = data?.commentsEnabled ?? false
   const commentSyntaxes = data?.commentSyntaxes
+  const scoreDecorationsByFile = useMemo(() => {
+    const rawScoresByFile: Record<string, unknown> = data?.scores ?? {}
+    const map = new Map<string, ReturnType<typeof createFileScoreDecorations>>()
+    for (const fileDiff of files) {
+      map.set(fileDiff.name, createFileScoreDecorations(rawScoresByFile[fileDiff.name]))
+    }
+    return map
+  }, [files, data?.scores])
 
   // Detect source-backed review blocks once and share the exact ranges between
   // annotation rendering and keyboard navigation. Keeping one source of truth
@@ -1385,6 +1199,8 @@ function DiffView() {
   const [cursor, setCursor] = useState<{ file: string; line: number } | null>(null)
   const cursorRef = useRef(cursor)
   cursorRef.current = cursor
+  const scoreDecorationsRef = useRef(scoreDecorationsByFile)
+  scoreDecorationsRef.current = scoreDecorationsByFile
 
   // Derive optimistic viewed state from pending mutations
   const viewed = useMemo(() => {
@@ -1483,11 +1299,14 @@ function DiffView() {
       const isCollapsed = collapsed[name] ?? false
       const isExpanded = expandedFiles[name] ?? false
       const composingLine = composing?.file === name ? composing.line : -1
+      const scoreSignature = scoreDecorationsByFile.get(name)?.signature ?? ''
       // fileDiff.isPartial flips false once full contents load, upgrading the
       // item to an expandable diff — bump the version so CodeView re-renders it.
       // isExpanded is in the key too: expand-all swaps fileDiff for a re-parse
       // at the same content hash, so nothing else here would move the version.
-      const key = `${fileHashes[name] ?? ''}|${composingLine}|${isCollapsed ? 1 : 0}|${fileDiff.isPartial ? 1 : 0}|${isExpanded ? 1 : 0}`
+      // Score coordinates and values are in the key so score-only refetches
+      // still re-render already-mounted items.
+      const key = `${fileHashes[name] ?? ''}|${composingLine}|${isCollapsed ? 1 : 0}|${fileDiff.isPartial ? 1 : 0}|${isExpanded ? 1 : 0}|${scoreSignature}`
       const prev = versionsRef.current.get(name)
       const version = !prev || prev.key !== key ? (prev?.version ?? 0) + 1 : prev.version
       if (!prev || prev.key !== key) versionsRef.current.set(name, { key, version })
@@ -1500,7 +1319,15 @@ function DiffView() {
         version,
       }
     })
-  }, [files, data, composing, collapsed, expandedFiles, reviewAnnotationsByFile])
+  }, [
+    files,
+    data,
+    composing,
+    collapsed,
+    expandedFiles,
+    reviewAnnotationsByFile,
+    scoreDecorationsByFile,
+  ])
   itemsRef.current = items
 
   // The header highlight falls back to the first file before any focus exists
@@ -1639,7 +1466,7 @@ function DiffView() {
               marginTop: `-${(meta.endLine - meta.startLine + 1) * 20}px`,
             }}
           >
-            <ReviewThread
+            <ReviewThreadCard
               thread={meta.thread}
               onResolve={() =>
                 resolveMutation.mutate({
@@ -1658,12 +1485,11 @@ function DiffView() {
                   threadId: meta.thread.threadId,
                 })
               }
-              followUpDraft={followUpDrafts[draftKey] ?? ''}
+              followUpDraft={followUpDrafts[draftKey]?.text ?? ''}
               onFollowUpDraftChange={(text) =>
-                setFollowUpDrafts((previous) => ({
-                  ...previous,
-                  [draftKey]: text,
-                }))
+                setFollowUpDrafts((previous) =>
+                  updateFollowUpDrafts(previous, draftKey, text),
+                )
               }
               resolving={
                 resolveMutation.isPending &&
@@ -1679,18 +1505,30 @@ function DiffView() {
                   ? followUpMutation.error.message
                   : null
               }
+              followUpRestoreFocus={followUpDrafts[draftKey]?.focused ?? false}
+              onFollowUpFocusChange={(focused) =>
+                setFollowUpDrafts((previous) =>
+                  updateFollowUpFocus(previous, draftKey, focused),
+                )
+              }
             />
           </div>
         )
       }
       if (meta.type === 'composing') {
         return (
-          <CommentForm
-            onSubmit={(text) =>
+          <ReviewComposer
+            draft={composing?.draft ?? emptyReviewComposerDraft()}
+            onDraftChange={(draft) =>
+              setComposing((previous) =>
+                updateComposerDraft(previous, file, annotation.lineNumber, draft),
+              )
+            }
+            onSubmit={(draft) =>
               commentMutation.mutate({
                 file,
                 afterLine: annotation.lineNumber,
-                text,
+                ...draft,
               })
             }
             onCancel={() => setComposing(null)}
@@ -1703,12 +1541,18 @@ function DiffView() {
                 : null
             }
             syntax={data?.commentSyntaxes[file] ?? null}
+            restoreFocus={composing?.focused ?? true}
+            onFocusChange={(focused) =>
+              setComposing((previous) =>
+                updateComposerFocus(previous, file, annotation.lineNumber, focused),
+              )
+            }
           />
         )
       }
       return null
     },
-    [resolveMutation, followUpMutation, followUpDrafts, commentMutation, data],
+    [resolveMutation, followUpMutation, followUpDrafts, commentMutation, composing, data],
   )
 
   // Gutter-utility click (start a comment). Routed through a ref so the
@@ -1726,8 +1570,7 @@ function DiffView() {
         range.start <= a.metadata.endLine,
     )
     if (insideReview) return
-    commentMutation.reset()
-    setComposing({ file: item.id, line: range.start })
+    startComposing(item.id, range.start)
   }
 
   const options = useMemo<CodeViewOptions<AnnotationMeta>>(
@@ -1759,7 +1602,7 @@ function DiffView() {
       // entirely, so the slot never exists and the portal has nowhere to land.
       stickyHeaders: true,
       enableGutterUtility: commentsEnabled,
-      unsafeCSS: REVIEW_CSS + EXPAND_PLACEHOLDER_CSS,
+      unsafeCSS: REVIEW_CSS + EXPAND_PLACEHOLDER_CSS + SCORE_GUTTER_CSS,
       onGutterUtilityClick: (range, context) => gutterClickRef.current(range, context.item),
       // Re-tag review-comment lines whenever an item (re)renders. Runs per item
       // and re-derives tags from scratch, so pooled/recycled elements never keep
@@ -1774,6 +1617,10 @@ function DiffView() {
           node.toggleAttribute('data-skepsis-partial', context.item.fileDiff.isPartial)
         }
         tagReviewLines(node, reviewRanges(context.item.annotations))
+        tagScoreLines(
+          node,
+          scoreDecorationsRef.current.get(context.item.id)?.lineScores ?? new Map(),
+        )
         // Re-apply the cursor selection: a re-rendered (version-bumped) or
         // pooled element loses its selection styling, and the library's own
         // re-sync short-circuits when the range is unchanged — so force it by
@@ -1933,8 +1780,7 @@ function DiffView() {
               cur.line <= a.metadata.endLine,
           )
           if (insideReview) break
-          commentMutation.reset()
-          setComposing({ file: cur.file, line: cur.line })
+          startComposing(cur.file, cur.line)
           break
         }
         case 'e': {
@@ -2022,7 +1868,7 @@ function DiffView() {
     anchorIfTopFile,
     fileLines,
     commentsEnabled,
-    commentMutation,
+    startComposing,
     setFocused,
     markProgrammaticScroll,
     cycleTheme,
@@ -2059,6 +1905,15 @@ function DiffView() {
             command={data.revset}
             fileHashes={fileHashes}
             viewed={viewed}
+            scoring={
+              scoreActionError.error
+                ? { ...scoring, error: scoreActionError.error }
+                : scoring
+            }
+            triggerScoring={() => scoreTriggerMutation.mutate()}
+            cancelScoring={() => scoreCancelMutation.mutate()}
+            triggerScoringPending={scoreTriggerMutation.isPending}
+            cancelScoringPending={scoreCancelMutation.isPending}
             theme={theme}
             onCycleTheme={cycleTheme}
             onUnviewAll={() => {
