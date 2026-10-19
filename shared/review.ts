@@ -16,13 +16,21 @@ export const anchorSchema = z.object({
 })
 export type ReviewAnchor = z.infer<typeof anchorSchema>
 
+export const reviewIntentSchema = z.enum(['question', 'propose-change'])
+export type ReviewIntent = z.infer<typeof reviewIntentSchema>
+
 const textSchema = z.string().trim().min(1).max(20_000)
 export const createThreadSchema = z.object({
   id: z.string().uuid(),
   anchor: anchorSchema,
   text: textSchema,
+  intent: reviewIntentSchema.optional(),
 })
-export const threadMessageSchema = z.object({ id: z.string().uuid(), text: textSchema })
+export const threadMessageSchema = z.object({
+  id: z.string().uuid(),
+  text: textSchema,
+  intent: reviewIntentSchema.optional(),
+})
 export const draftSchema = z.object({
   id: z.string().uuid(),
   anchor: anchorSchema,
@@ -62,6 +70,8 @@ export interface PullRequest {
 export interface ThreadTurn {
   id: string
   question: string
+  /** Missing on older turns; equivalent to question. */
+  intent?: ReviewIntent
   answer?: string
   error?: string
 }

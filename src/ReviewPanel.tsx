@@ -6,10 +6,14 @@
  * Copyright Oxide Computer Company
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { PUBLICATION_ABANDON_ACK, reviewDraftsDigest } from '../shared/review.ts'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { ReviewAnchor, ReviewSnapshot, SubmitReview } from '../shared/review.ts'
+import { ReviewMarkdown, safeReviewUrl } from './ReviewMarkdown.tsx'
+import './review.css'
+
+type ComposerMode = 'ask' | 'propose-change' | 'draft'
 
 export const anchorKey = (a: ReviewAnchor) =>
   JSON.stringify([a.path, a.side, a.line, a.revision])
@@ -26,7 +30,11 @@ export function bufferAnchors(text: Record<string, string>): ReviewAnchor[] {
   })
 }
 
-async function reviewRequest<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+export async function reviewRequest<T>(
+  path: string,
+  method = 'GET',
+  body?: unknown,
+): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (method !== 'GET') {
     const session = await fetch('/api/session')
@@ -55,7 +63,8 @@ export function useReview() {
   })
   // Kept above virtualized cards: recycling never discards unsaved text or mode.
   const [text, setText] = useState<Record<string, string>>({})
-  const [modes, setModes] = useState<Record<string, 'ask' | 'draft'>>({})
+  const [modes, setModes] = useState<Record<string, ComposerMode>>({})
+  const [previews, setPreviews] = useState<Record<string, boolean>>({})
   const focusComposer = useRef<string | null>(null)
   // Retrying the same input after a lost response must reuse its durable ID.
   const requestIds = useRef(new Map<string, string>())
@@ -137,9 +146,122 @@ export function useReview() {
       reviewRequest(path, 'POST', body),
     onSettled: () => qc.invalidateQueries({ queryKey: ['review'] }),
   })
-  return { ...query, text, setText, modes, setModes, mutation, control, focusComposer }
+  return {
+    ...query,
+    text,
+    setText,
+    modes,
+    setModes,
+    previews,
+    setPreviews,
+    mutation,
+    control,
+    focusComposer,
+  }
 }
 export type ReviewController = ReturnType<typeof useReview>
+
+function MarkdownEditor({
+  label,
+  text,
+  preview,
+  onPreview,
+  children,
+}: {
+  label: string
+  text: string
+  preview: boolean
+  onPreview: (preview: boolean) => void
+  children: ReactNode
+}) {
+  const inputPane = useRef<HTMLDivElement>(null)
+  const focusOnWrite = useRef(false)
+  useEffect(() => {
+    if (preview || !focusOnWrite.current) return
+    focusOnWrite.current = false
+    const input = inputPane.current?.querySelector('textarea')
+    if (input && !input.disabled && input.checkVisibility()) input.focus()
+  }, [preview])
+  return (
+    <div className="review-editor">
+      <div className="review-editor-toolbar">
+        <div className="review-segments" role="group" aria-label={`${label} editor mode`}>
+          <button
+            type="button"
+            aria-pressed={!preview}
+            onClick={() => {
+              if (preview) focusOnWrite.current = true
+              else
+                inputPane.current
+                  ?.querySelector<HTMLTextAreaElement>('textarea:not(:disabled)')
+                  ?.focus()
+              onPreview(false)
+            }}
+          >
+            Write
+          </button>
+          <button type="button" aria-pressed={preview} onClick={() => onPreview(true)}>
+            Preview
+          </button>
+        </div>
+        <span className="review-hint">Markdown supported</span>
+      </div>
+      {/* Keep the editor mounted so previewing never resets its selection or scroll. */}
+      <div className="review-editor-input" ref={inputPane} hidden={preview}>
+        {children}
+      </div>
+      {preview && (
+        <div
+          className="review-editor-preview"
+          role="region"
+          aria-label={`${label} preview`}
+        >
+          {text.trim() ? (
+            <ReviewMarkdown text={text} />
+          ) : (
+            <p className="review-hint">Nothing to preview yet.</p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function DraftNotice() {
+  return (
+    <p className="review-notice">
+      <strong>Draft only — not published.</strong> Saving keeps this comment private. Select
+      it and preview the review before publishing.
+    </p>
+  )
+}
+
+function ChatMessage({
+  agent = false,
+  label,
+  children,
+}: {
+  agent?: boolean
+  label: string
+  children: ReactNode
+}) {
+  return (
+    <div
+      className={`review-message ${agent ? 'review-message-agent' : 'review-message-user'}`}
+    >
+      <span className="review-avatar" aria-hidden="true">
+        {agent ? 'AI' : 'YO'}
+      </span>
+      <div className="review-message-card">
+        <header className="review-message-header">
+          <strong>{agent ? 'Agent' : 'You'}</strong>
+          <span>{label}</span>
+        </header>
+        {children}
+      </div>
+    </div>
+  )
+}
 
 export function LineChat({
   anchor,
@@ -160,6 +282,7 @@ export function LineChat({
   const setText = (id: string, value: string) =>
     review.setText((prev) => ({ ...prev, [id]: value }))
   const mode = review.modes[key] ?? 'ask'
+  const isDraft = mode === 'draft'
   const busy = review.mutation.isPending
   const send = review.mutation.mutate
   const close = () => {
@@ -168,60 +291,109 @@ export function LineChat({
       delete next[key]
       return next
     })
+    review.setPreviews((prev) => ({ ...prev, [key]: false }))
     onClose?.()
   }
-  const copyAnswer = (answer: string) => {
+  const compose = (text: string, targetMode: ComposerMode) => {
     if (
-      review.text[key]?.trim() &&
-      review.text[key] !== answer &&
-      !window.confirm('Replace your unsaved composition with this answer?')
+      review.text[key] &&
+      review.text[key] !== text &&
+      !window.confirm('Replace your unsaved composition?')
     )
       return
     review.focusComposer.current = key
-    setText(key, answer)
-    review.setModes((prev) => ({ ...prev, [key]: 'draft' }))
+    setText(key, text)
+    review.setPreviews((prev) => ({ ...prev, [key]: false }))
+    review.setModes((prev) => ({ ...prev, [key]: targetMode }))
   }
   return (
     <section className="durable-line-chat" onClick={(e) => e.stopPropagation()}>
-      <small>
-        {anchor.path}:{anchor.line} · {anchor.side} ·{' '}
-        {anchor.revision !== snapshot.revision ? 'Outdated' : 'Private line chat'}
-      </small>
+      <header className="review-line-header">
+        <span className="review-location">
+          {anchor.path}:{anchor.line} <span>· {anchor.side}</span>
+        </span>
+        <span
+          className="review-pill"
+          data-tone={anchor.revision !== snapshot.revision ? 'warning' : undefined}
+        >
+          {anchor.revision !== snapshot.revision ? 'Outdated' : 'Private line chat'}
+        </span>
+      </header>
       {threads.map((thread) => (
         <article key={thread.id} className="durable-thread">
-          <strong>
-            {thread.status}
-            {thread.resolved ? ' · Resolved' : ''}
-          </strong>
-          {thread.turns.map((turn) => (
-            <div key={turn.id}>
-              <p className="review-prose">
-                <strong>You: </strong>
-                {turn.question}
-              </p>
-              {turn.answer && (
-                <>
-                  <p className="review-prose">
-                    <strong>Agent: </strong>
-                    {turn.answer}
-                  </p>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => copyAnswer(turn.answer!)}
+          <header className="review-thread-header">
+            <strong>Conversation</strong>
+            <span
+              className="review-pill"
+              data-tone={thread.status === 'failed' ? 'warning' : undefined}
+            >
+              {thread.status}
+            </span>
+            {thread.resolved && (
+              <span className="review-pill" data-tone="success">
+                Resolved
+              </span>
+            )}
+          </header>
+          <div className="review-timeline">
+            {thread.turns.map((turn) => (
+              <div key={turn.id} className="review-turn">
+                <ChatMessage
+                  label={
+                    turn.intent === 'propose-change'
+                      ? 'Change request · private'
+                      : 'Question · private'
+                  }
+                >
+                  <ReviewMarkdown text={turn.question} />
+                </ChatMessage>
+                {turn.answer && (
+                  <ChatMessage
+                    agent
+                    label={
+                      turn.intent === 'propose-change'
+                        ? 'Proposed change (private)'
+                        : 'Private answer'
+                    }
                   >
-                    Create review comment
-                  </button>
-                </>
-              )}
-              {turn.error && <p role="alert">{turn.error}</p>}
-            </div>
-          ))}
-          {thread.partial && (
-            <p className="review-prose" aria-live="polite">
-              {thread.partial}
-            </p>
-          )}
+                    <ReviewMarkdown text={turn.answer} />
+                    <div className="durable-actions review-answer-actions">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => compose(turn.answer!, 'draft')}
+                      >
+                        Create review comment
+                      </button>
+                      <span className="review-hint">
+                        Opens an editable draft, not a publication.
+                      </span>
+                    </div>
+                  </ChatMessage>
+                )}
+                {turn.error && <p role="alert">{turn.error}</p>}
+              </div>
+            ))}
+            {(thread.partial || ['queued', 'running'].includes(thread.status)) && (
+              <ChatMessage agent label="Private response">
+                {thread.partial && <ReviewMarkdown text={thread.partial} />}
+                {['queued', 'running'].includes(thread.status) && (
+                  <div className="review-streaming" role="status">
+                    <span className="review-streaming-dots" aria-hidden="true">
+                      <i />
+                      <i />
+                      <i />
+                    </span>
+                    {thread.status === 'queued'
+                      ? 'Waiting for the agent…'
+                      : thread.partial
+                        ? 'Agent is writing…'
+                        : 'Agent is thinking…'}
+                  </div>
+                )}
+              </ChatMessage>
+            )}
+          </div>
           <div className="durable-actions">
             {['queued', 'running'].includes(thread.status) && (
               <button
@@ -247,7 +419,7 @@ export function LineChat({
             )}
           </div>
           {thread.providerChange && (
-            <div role="alert">
+            <div className="review-consent" role="alert">
               <p>
                 Provider changed from {thread.providerChange.from} to{' '}
                 {thread.providerChange.to}. Continuing sends retained private history to the
@@ -268,104 +440,211 @@ export function LineChat({
             </div>
           )}
           {!thread.resolved && (
-            <>
+            <div className="review-follow-up">
+              <div className="review-editor-toolbar">
+                <strong>Continue privately</strong>
+                <span className="review-hint">Markdown supported</span>
+              </div>
               <textarea
                 disabled={busy}
                 maxLength={20_000}
                 aria-label="Private follow-up"
                 value={review.text[thread.id] ?? ''}
                 onChange={(e) => setText(thread.id, e.target.value)}
-                placeholder="Private follow-up"
+                placeholder="Ask a follow-up, or describe a change to propose…"
               />
-              <button
-                type="button"
-                disabled={
-                  busy ||
-                  !!thread.providerChange ||
-                  !snapshot.agent.available ||
-                  ['queued', 'running'].includes(thread.status) ||
-                  !review.text[thread.id]?.trim()
-                }
-                onClick={() =>
-                  send({
-                    path: `/api/threads/${thread.id}/messages`,
-                    body: { id: crypto.randomUUID(), text: review.text[thread.id] },
-                    clear: thread.id,
-                  })
-                }
-              >
-                Ask agent privately
-              </button>
-            </>
-          )}
-        </article>
-      ))}
-      {drafts.map((draft) => (
-        <article key={draft.id}>
-          <strong>
-            {draft.publishedReviewId ? 'Published review comment' : 'Draft review comment'}
-          </strong>
-          <textarea
-            aria-label="Review comment draft"
-            disabled={busy || !!draft.publishedReviewId}
-            maxLength={20_000}
-            value={review.text[draft.id] ?? draft.body}
-            onChange={(e) => setText(draft.id, e.target.value)}
-          />
-          {!draft.publishedReviewId && (
-            <div className="durable-actions">
-              <button
-                type="button"
-                disabled={busy || !(review.text[draft.id] ?? draft.body).trim()}
-                onClick={() =>
-                  send({
-                    path: '/api/drafts',
-                    method: 'PUT',
-                    body: {
-                      id: draft.id,
-                      anchor: draft.anchor,
-                      body: review.text[draft.id] ?? draft.body,
-                    },
-                    clear: draft.id,
-                  })
-                }
-              >
-                Save draft
-              </button>
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() =>
-                  send({
-                    path: `/api/drafts/${draft.id}`,
-                    method: 'DELETE',
-                    clear: draft.id,
-                  })
-                }
-              >
-                Delete draft
-              </button>
+              <div className="durable-actions">
+                <button
+                  type="button"
+                  disabled={
+                    busy ||
+                    !!thread.providerChange ||
+                    !snapshot.agent.available ||
+                    ['queued', 'running'].includes(thread.status) ||
+                    !review.text[thread.id]?.trim()
+                  }
+                  onClick={() =>
+                    send({
+                      path: `/api/threads/${thread.id}/messages`,
+                      body: { id: crypto.randomUUID(), text: review.text[thread.id] },
+                      clear: thread.id,
+                    })
+                  }
+                >
+                  Ask agent privately
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    busy ||
+                    !!thread.providerChange ||
+                    !snapshot.agent.available ||
+                    ['queued', 'running'].includes(thread.status)
+                  }
+                  onClick={() =>
+                    send({
+                      path: `/api/threads/${thread.id}/messages`,
+                      body: {
+                        id: crypto.randomUUID(),
+                        intent: 'propose-change',
+                        text: review.text[thread.id]?.trim()
+                          ? review.text[thread.id]
+                          : 'Propose a minimal change to address the issue discussed in this thread.',
+                      },
+                      clear: thread.id,
+                    })
+                  }
+                >
+                  Propose a change
+                </button>
+              </div>
             </div>
           )}
         </article>
       ))}
-      {(composing || review.text[key] !== undefined) && (
-        <div>
-          <label>
-            Compose{' '}
-            <select
-              value={mode}
-              onChange={(e) =>
-                review.setModes((prev) => ({
-                  ...prev,
-                  [key]: e.target.value as 'ask' | 'draft',
-                }))
-              }
+      {drafts.map((draft) => (
+        <article key={draft.id} className="review-draft">
+          <header className="review-thread-header">
+            <strong>
+              {draft.publishedReviewId
+                ? 'Published review comment'
+                : 'Draft review comment'}
+            </strong>
+            <span
+              className="review-pill"
+              data-tone={draft.publishedReviewId ? 'success' : undefined}
             >
-              <option value="ask">Ask agent (private)</option>
-              <option value="draft">Draft review comment</option>
-            </select>
-          </label>
+              {draft.publishedReviewId
+                ? 'Published'
+                : review.text[draft.id] !== undefined &&
+                    review.text[draft.id] !== draft.body
+                  ? 'Unsaved edits'
+                  : 'Saved privately'}
+            </span>
+          </header>
+          {!draft.publishedReviewId && <DraftNotice />}
+          <MarkdownEditor
+            label="Review comment draft"
+            text={review.text[draft.id] ?? draft.body}
+            preview={review.previews[draft.id] ?? !!draft.publishedReviewId}
+            onPreview={(preview) =>
+              review.setPreviews((prev) => ({ ...prev, [draft.id]: preview }))
+            }
+          >
+            <textarea
+              aria-label="Review comment draft"
+              disabled={busy || !!draft.publishedReviewId}
+              maxLength={20_000}
+              value={review.text[draft.id] ?? draft.body}
+              onChange={(e) => setText(draft.id, e.target.value)}
+            />
+          </MarkdownEditor>
+          <div className="durable-actions">
+            <button
+              type="button"
+              disabled={busy || !(review.text[draft.id] ?? draft.body).trim()}
+              onClick={() => compose(review.text[draft.id] ?? draft.body, 'propose-change')}
+            >
+              Use comment as change request
+            </button>
+            {!draft.publishedReviewId && (
+              <>
+                <button
+                  type="button"
+                  disabled={busy || !(review.text[draft.id] ?? draft.body).trim()}
+                  onClick={() =>
+                    send({
+                      path: '/api/drafts',
+                      method: 'PUT',
+                      body: {
+                        id: draft.id,
+                        anchor: draft.anchor,
+                        body: review.text[draft.id] ?? draft.body,
+                      },
+                      clear: draft.id,
+                    })
+                  }
+                >
+                  Save draft
+                </button>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() =>
+                    send({
+                      path: `/api/drafts/${draft.id}`,
+                      method: 'DELETE',
+                      clear: draft.id,
+                    })
+                  }
+                >
+                  Delete draft
+                </button>
+              </>
+            )}
+          </div>
+        </article>
+      ))}
+      {(composing || review.text[key] !== undefined) && (
+        <div className="review-composer">
+          <div className="review-composer-heading">
+            <strong>
+              {isDraft
+                ? 'Draft a review comment'
+                : mode === 'propose-change'
+                  ? 'Request a proposed change'
+                  : 'Start a private conversation'}
+            </strong>
+            <div
+              className="review-segments review-mode-buttons"
+              role="group"
+              aria-label="Compose"
+            >
+              {(['ask', 'propose-change', 'draft'] as const).map((value) => (
+                <button
+                  key={value}
+                  type="button"
+                  aria-pressed={mode === value}
+                  onClick={() => review.setModes((prev) => ({ ...prev, [key]: value }))}
+                >
+                  {value === 'ask'
+                    ? 'Private question'
+                    : value === 'propose-change'
+                      ? 'Propose a change (private)'
+                      : 'Draft review comment'}
+                </button>
+              ))}
+            </div>
+            <label className="review-mode-select">
+              Compose{' '}
+              <select
+                value={mode}
+                onChange={(e) =>
+                  review.setModes((prev) => ({
+                    ...prev,
+                    [key]: e.target.value as ComposerMode,
+                  }))
+                }
+              >
+                <option value="ask">Private question</option>
+                <option value="propose-change">Propose a change (private)</option>
+                <option value="draft">Draft review comment</option>
+              </select>
+            </label>
+          </div>
+          {isDraft && <DraftNotice />}
+          {mode === 'ask' && (
+            <p className="review-hint">
+              Ask about this line. Your conversation stays private and never becomes a
+              review automatically.
+            </p>
+          )}
+          {mode === 'propose-change' && (
+            <p className="review-notice">
+              A private proposal only: no files are edited or comments published. You can
+              copy the answer into an editable review draft.
+            </p>
+          )}
           {!snapshot.agent.available && (
             <p>
               Agent unavailable:{' '}
@@ -373,46 +652,82 @@ export function LineChat({
               still save review drafts.
             </p>
           )}
-          <textarea
-            ref={(node) => {
-              if (node && node.checkVisibility() && review.focusComposer.current === key) {
-                review.focusComposer.current = null
-                node.focus()
+          <MarkdownEditor
+            label={
+              isDraft
+                ? 'New review draft'
+                : mode === 'propose-change'
+                  ? 'Private change request'
+                  : 'Private question'
+            }
+            text={review.text[key] ?? ''}
+            preview={review.previews[key] ?? false}
+            onPreview={(preview) =>
+              review.setPreviews((prev) => ({ ...prev, [key]: preview }))
+            }
+          >
+            <textarea
+              ref={(node) => {
+                if (
+                  node &&
+                  node.checkVisibility() &&
+                  review.focusComposer.current === key
+                ) {
+                  review.focusComposer.current = null
+                  node.focus()
+                }
+              }}
+              disabled={busy}
+              maxLength={20_000}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  close()
+                }
+              }}
+              aria-label={
+                isDraft
+                  ? 'New review draft'
+                  : mode === 'propose-change'
+                    ? 'Private change request'
+                    : 'Private question'
               }
-            }}
-            disabled={busy}
-            maxLength={20_000}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                e.preventDefault()
-                e.stopPropagation()
-                close()
+              placeholder={
+                isDraft
+                  ? 'Write a comment for the public review…'
+                  : mode === 'propose-change'
+                    ? 'What should change, and why?'
+                    : 'What would you like to understand?'
               }
-            }}
-            aria-label={mode === 'ask' ? 'Private question' : 'New review draft'}
-            value={review.text[key] ?? ''}
-            onChange={(e) => setText(key, e.target.value)}
-          />
+              value={review.text[key] ?? ''}
+              onChange={(e) => setText(key, e.target.value)}
+            />
+          </MarkdownEditor>
           <div className="durable-actions">
             <button
+              className="review-primary"
               type="button"
               disabled={
-                busy ||
-                !review.text[key]?.trim() ||
-                (mode === 'ask' && !snapshot.agent.available)
+                busy || !review.text[key]?.trim() || (!isDraft && !snapshot.agent.available)
               }
               onClick={() =>
                 send(
                   {
-                    path: mode === 'ask' ? '/api/threads' : '/api/drafts',
-                    method: mode === 'ask' ? 'POST' : 'PUT',
+                    path: isDraft ? '/api/drafts' : '/api/threads',
+                    method: isDraft ? 'PUT' : 'POST',
                     creation: true,
                     body: {
                       id: crypto.randomUUID(),
                       anchor,
-                      ...(mode === 'ask'
-                        ? { text: review.text[key] }
-                        : { body: review.text[key] }),
+                      ...(isDraft
+                        ? { body: review.text[key] }
+                        : {
+                            text: review.text[key],
+                            ...(mode === 'propose-change'
+                              ? { intent: 'propose-change' }
+                              : {}),
+                          }),
                     },
                     clear: key,
                   },
@@ -420,7 +735,11 @@ export function LineChat({
                 )
               }
             >
-              {mode === 'ask' ? 'Ask agent privately' : 'Save draft'}
+              {isDraft
+                ? 'Save draft'
+                : mode === 'propose-change'
+                  ? 'Ask for a proposed change'
+                  : 'Ask agent privately'}
             </button>
             <button type="button" onClick={close}>
               Close
@@ -437,6 +756,7 @@ export function LineChat({
 export function ReviewPanel({ review }: { review: ReviewController }) {
   const [selected, setSelected] = useState<Record<string, boolean>>({})
   const [summary, setSummary] = useState('')
+  const [summaryPreview, setSummaryPreview] = useState(false)
   const [event, setEvent] = useState<SubmitReview['event']>('COMMENT')
   const [preview, setPreview] = useState<{
     fingerprint: string
@@ -445,11 +765,16 @@ export function ReviewPanel({ review }: { review: ReviewController }) {
   const [acknowledged, setAcknowledged] = useState(false)
   const snapshot = review.data
   const publication = snapshot?.publication
+  const publicationUrl =
+    publication?.url && /^https?:\/\//i.test(publication.url)
+      ? safeReviewUrl(publication.url)
+      : undefined
   const published = useRef<string | null>(null)
   useEffect(() => {
     if (publication?.status === 'published' && published.current !== publication.id) {
       published.current = publication.id
       setSummary('')
+      setSummaryPreview(false)
       setEvent('COMMENT')
       setSelected({})
       setPreview(null)
@@ -491,11 +816,18 @@ export function ReviewPanel({ review }: { review: ReviewController }) {
     publication?.status === 'uncertain'
   return (
     <details className="durable-review-panel">
-      <summary>
-        Review · {drafts.length} drafts · {snapshot.threads.length} threads
+      <summary className="review-panel-heading">
+        Review{' '}
+        <span className="review-pill">
+          {drafts.length} draft{drafts.length === 1 ? '' : 's'}
+        </span>{' '}
+        <span className="review-pill">
+          {snapshot.threads.length} private thread{snapshot.threads.length === 1 ? '' : 's'}
+        </span>
       </summary>
-      <p>
-        Only selected saved drafts and summary are published. Private chats are excluded.
+      <p className="review-notice">
+        <strong>You control what is published.</strong> Only selected saved drafts and
+        summary are published. Private chats are excluded.
       </p>
       {snapshot.agent.codemode && (
         <p>Codemode enabled: sandboxed JavaScript with read-only repository tools.</p>
@@ -536,7 +868,7 @@ export function ReviewPanel({ review }: { review: ReviewController }) {
             : ''}
         </label>
       ))}
-      <details>
+      <details className="review-archive">
         <summary>
           Current threads and draft comments (including unsaved and resolved)
         </summary>
@@ -544,7 +876,7 @@ export function ReviewPanel({ review }: { review: ReviewController }) {
           <LineChat key={anchorKey(a)} anchor={a} review={review} />
         ))}
       </details>
-      <details>
+      <details className="review-archive">
         <summary>
           Outdated threads/drafts and unsaved compositions ({outdated.length})
         </summary>
@@ -556,82 +888,98 @@ export function ReviewPanel({ review }: { review: ReviewController }) {
           <LineChat key={anchorKey(a)} anchor={a} review={review} />
         ))}
       </details>
-      <label>
-        Review outcome{' '}
-        <select
-          disabled={blocked}
-          value={event}
-          onChange={(e) => setEvent(e.target.value as SubmitReview['event'])}
+      <section className="review-publication-composer" aria-label="Prepare a public review">
+        <h3>Prepare a public review</h3>
+        <label className="review-outcome">
+          Review outcome{' '}
+          <select
+            disabled={blocked}
+            value={event}
+            onChange={(e) => setEvent(e.target.value as SubmitReview['event'])}
+          >
+            <option value="COMMENT">Comment</option>
+            <option value="APPROVE">Approve</option>
+            <option value="REQUEST_CHANGES">Request changes</option>
+          </select>
+        </label>
+        <MarkdownEditor
+          label="Review summary"
+          text={summary}
+          preview={summaryPreview}
+          onPreview={setSummaryPreview}
         >
-          <option value="COMMENT">Comment</option>
-          <option value="APPROVE">Approve</option>
-          <option value="REQUEST_CHANGES">Request changes</option>
-        </select>
-      </label>
-      <textarea
-        disabled={blocked}
-        maxLength={20_000}
-        aria-label="Review summary"
-        placeholder="Public review summary"
-        value={summary}
-        onChange={(e) => setSummary(e.target.value)}
-      />
-      {unsaved && (
-        <p>
-          Save edits to selected drafts before previewing. Unselected drafts and private
-          compositions are not published.
-        </p>
-      )}
-      <button
-        type="button"
-        disabled={blocked || unsaved || !snapshot.pullRequest}
-        onClick={async () =>
-          setPreview({
-            fingerprint,
-            payload: {
-              id: crypto.randomUUID(),
-              event,
-              body: summary,
-              draftIds: chosen.map((d) => d.id),
-              draftsDigest: await reviewDraftsDigest(chosen),
-            },
-          })
-        }
-      >
-        Preview review
-      </button>
+          <textarea
+            disabled={blocked}
+            maxLength={20_000}
+            aria-label="Review summary"
+            placeholder="Public review summary"
+            value={summary}
+            onChange={(e) => setSummary(e.target.value)}
+          />
+        </MarkdownEditor>
+        {unsaved && (
+          <p>
+            Save edits to selected drafts before previewing. Unselected drafts and private
+            compositions are not published.
+          </p>
+        )}
+        <button
+          type="button"
+          disabled={blocked || unsaved || !snapshot.pullRequest}
+          onClick={async () =>
+            setPreview({
+              fingerprint,
+              payload: {
+                id: crypto.randomUUID(),
+                event,
+                body: summary,
+                draftIds: chosen.map((d) => d.id),
+                draftsDigest: await reviewDraftsDigest(chosen),
+              },
+            })
+          }
+        >
+          Preview review
+        </button>
+      </section>
       {preview && preview.fingerprint === fingerprint && !unsaved && (
         <section className="publication-preview" aria-label="Public review preview">
           <h3>Public review preview</h3>
           <p>Outcome: {preview.payload.event}. Private chats are excluded.</p>
-          <p className="review-prose">{preview.payload.body}</p>
+          <ReviewMarkdown text={preview.payload.body} />
           {chosen.map((d) => (
             <article key={d.id}>
               <strong>
                 {d.anchor.path}:{d.anchor.line} ({d.anchor.side}) · {d.anchor.revision}
               </strong>
-              <p className="review-prose">{d.body}</p>
+              <ReviewMarkdown text={d.body} />
             </article>
           ))}
-          <button
-            type="button"
-            disabled={blocked}
-            onClick={() =>
-              review.mutation.mutate({ path: '/api/review/submit', body: preview.payload })
-            }
-          >
-            Confirm submit to GitHub
-          </button>
-          <button type="button" disabled={blocked} onClick={() => setPreview(null)}>
-            Cancel preview
-          </button>
+          <div className="durable-actions">
+            <button
+              className="review-primary"
+              type="button"
+              disabled={blocked}
+              onClick={() =>
+                review.mutation.mutate({
+                  path: '/api/review/submit',
+                  body: preview.payload,
+                })
+              }
+            >
+              Confirm submit to GitHub
+            </button>
+            <button type="button" disabled={blocked} onClick={() => setPreview(null)}>
+              Cancel preview
+            </button>
+          </div>
         </section>
       )}
       {publication && (
         <p role="status">
           Publication: {publication.status} {publication.error}{' '}
-          {publication.url && (
-            <a href={publication.url} target="_blank" rel="noreferrer">
+          {publicationUrl && (
+            <a href={publicationUrl} target="_blank" rel="noopener noreferrer">
               View review
             </a>
           )}

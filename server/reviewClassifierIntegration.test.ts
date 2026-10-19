@@ -10,21 +10,42 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context'
 import { Type } from '@earendil-works/pi-ai'
-import type { MutableModels } from '@earendil-works/pi-ai/models'
+import { createModels, type MutableModels } from '@earendil-works/pi-ai/models'
 import {
   fauxAssistantMessage,
   fauxProvider,
   fauxToolCall,
 } from '@earendil-works/pi-ai/providers/faux'
-import { defineTool } from '@earendil-works/pi-durable'
+import { Harness, createRegistry, defineTool } from '@earendil-works/pi-durable'
+import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node'
 import { expect, it } from 'vitest'
 import { setupReviewAgentWithEnvironment } from './reviewAgent.ts'
 import { openReviewStore, type ReviewStore } from './reviewStore.ts'
 
-it.each([false, true])(
-  'replays a configured classifier result without resending it (policy changed: %s)',
-  async (changePolicy) => {
+// Inspect the committed native ledger only while the review store is closed.
+// No resume/submit: unfinished classifier work must not run in this inspector.
+async function toolUsage(directory: string) {
+  const inspector = await Harness.open(
+    await openNodeSqliteStorage(join(directory, 'review.sqlite')),
+    { models: createModels(), registry: createRegistry() },
+    context,
+  )
+  try {
+    return (await inspector.usage(context)).tools
+  } finally {
+    await inspector.close(context)
+  }
+}
+
+it.each(
+  [false, true].flatMap((changePolicy) =>
+    [false, true].map((viaTool) => ({ changePolicy, viaTool })),
+  ),
+)(
+  'replays a configured classifier result without resending or double-counting usage (policy changed: $changePolicy, parallel tool: $viaTool)',
+  async ({ changePolicy, viaTool }) => {
     const directory = await mkdtemp(join(tmpdir(), 'skepsis-classifier-integration-'))
     const requests: { url: string; authorization?: string; body: unknown }[] = []
     const server = createServer(async (request, response) => {
@@ -38,6 +59,7 @@ it.each([false, true])(
       response.setHeader('content-type', 'application/json')
       response.end(
         JSON.stringify({
+          usage: { input_tokens: 13, output_tokens: 5 },
           answers: {
             flag: { type: 'noul', noul: 0.7 },
             level: { type: 'score', score: 1.2, confidence: 0.6 },
@@ -67,6 +89,26 @@ it.each([false, true])(
         endpoint,
         apiKeyEnv: 'DECISION_KEY',
         timeoutMs: 2000,
+        cost: { input: 2, output: 4 },
+      }
+      const inputCost = (config.cost.input / 1_000_000) * 13
+      const outputCost = (config.cost.output / 1_000_000) * 5
+      const expectedUsage = {
+        input: 13,
+        output: 5,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 18,
+        cost: {
+          input: inputCost,
+          output: outputCost,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: inputCost + outputCost,
+        },
+      }
+      const expectedToolUsage = {
+        [viaTool ? 'classify_review' : 'pi.codemode.models.classify']: expectedUsage,
       }
       await writeFile(configPath, JSON.stringify(config))
       const cwd = join(directory, 'source')
@@ -91,17 +133,20 @@ it.each([false, true])(
       const wait = defineTool({
         name: 'wait_here',
         description: 'Wait at the replay boundary',
-        parameters: Type.Object({ catalog: Type.String() }),
+        parameters: Type.Object({ catalog: Type.String(), usage: Type.Unknown() }),
         replay: 'safe',
-        execute: async ({ catalog }, _api, context) => {
+        execute: async ({ catalog, usage }, _api, toolContext) => {
           waitCalls++
+          // The native structured result retains tokens and priced usage, including
+          // when the VM receives its completed result from the replay journal.
+          expect(usage).toEqual(expectedUsage)
           expect(requests).toHaveLength(1)
           expect(catalog).toContain(config.model)
           expect(catalog).not.toContain(env.DECISION_KEY)
           expect(catalog).not.toContain(env.OPENAI_API_KEY)
           if (waitCalls === 1) {
             await new Promise<void>((_resolve, reject) => {
-              const signal = context.abortSignal
+              const signal = toolContext.abortSignal
               const timer = setTimeout(() => {
                 cleanup()
                 reject(new Error('Wait was not aborted'))
@@ -135,15 +180,16 @@ it.each([false, true])(
       }
       const code = `const catalog = await models.getAvailableOfType('classifier');
       if (catalog.length !== 1) throw new Error('Unexpected classifier catalog');
-      const result = await models.classify(catalog[0], {
+      const input = {
         state: { text: 'review fixture' }, questions: {
           flag: { type: 'bool', instructions: 'Flag?', criteria: { true: 'Yes', false: 'No' } },
           level: { type: 'score', instructions: 'Level', criteria: ['low', 'medium', 'high'] },
           pick: { type: 'choice', instructions: 'Pick', criteria: { yes: 'Yes', no: 'No' } }
         }
-      });
+      };
+      const result = await ${viaTool ? 'tools.classify_review({model: catalog[0], context: input})' : 'models.classify(catalog[0], input)'};
       if (result.stopReason !== 'stop') throw new Error('Classification failed');
-      await tools.wait_here({ catalog: JSON.stringify(catalog) });
+      await tools.wait_here({ catalog: JSON.stringify(catalog), usage: result.usage });
       if (result.answers.flag.type !== 'bool' || result.answers.flag.probability !== 0.7 ||
           result.answers.level.type !== 'score' || result.answers.level.score !== 1.2 || result.answers.level.confidence !== 0.6 ||
           result.answers.pick.type !== 'choice' || result.answers.pick.choice !== 'yes' ||
@@ -188,6 +234,8 @@ it.each([false, true])(
       expect((await store.snapshot()).threads[0]?.status).toBe('running')
       await store.close()
       expect(aborted).toBe(true)
+      // Count the nested native tool once, not again under the codemode parent.
+      expect(await toolUsage(opts.directory)).toEqual(expectedToolUsage)
       if (changePolicy)
         await writeFile(
           configPath,
@@ -222,6 +270,10 @@ it.each([false, true])(
       expect(JSON.stringify(snapshot)).not.toContain(env.OPENAI_API_KEY)
       expect(await readFile(join(cwd, 'source.ts'), 'utf8')).toBe('original\n')
       expect(await readdir(cwd)).toEqual(['source.ts'])
+      await store.close()
+      // Replaying a completed nested result (or refusing a changed policy) must
+      // preserve the exact same ledger, rather than charge the classifier twice.
+      expect(await toolUsage(opts.directory)).toEqual(expectedToolUsage)
     } finally {
       await store?.close()
       server.closeAllConnections()

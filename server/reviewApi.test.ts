@@ -20,7 +20,11 @@ import {
   type PullRequest,
 } from '../shared/review.ts'
 import { createModels } from '@earendil-works/pi-ai/models'
-import { fauxAssistantMessage, fauxProvider } from '@earendil-works/pi-ai/providers/faux'
+import {
+  fauxAssistantMessage,
+  fauxProvider,
+  type FauxResponseFactory,
+} from '@earendil-works/pi-ai/providers/faux'
 import { mountReviewApi } from './reviewApi.ts'
 import type { ReviewStore } from './reviewStore.ts'
 import type { DiffArgs } from '../shared/types.ts'
@@ -65,7 +69,6 @@ async function fixture(pullRequest?: PullRequest) {
     args: ['HEAD'],
     files: [],
     endpoints: { left: 'HEAD', right: 'workingCopy' },
-    commentsEnabled: true,
   }
   let servedPatch: string | undefined
   const open = async () => {
@@ -85,7 +88,7 @@ async function fixture(pullRequest?: PullRequest) {
       },
     })
     stores.push(store)
-    app.post('/api/legacy', (c) => c.json({ ok: true }))
+    app.post('/api/shared', (c) => c.json({ ok: true }))
     app.get('/api/diff', (c) =>
       c.json({ patch: servedPatch ?? git(...diffCommand(source).args) }),
     )
@@ -103,6 +106,7 @@ async function fixture(pullRequest?: PullRequest) {
   return {
     cwd,
     source,
+    faux,
     setPatch: (patch: string) => {
       servedPatch = patch
     },
@@ -255,7 +259,7 @@ it.each(['COMMENT', 'REQUEST_CHANGES'] as const)(
   },
 )
 
-it('enforces origin, host, token and resource bounds while protecting legacy APIs', async () => {
+it('enforces origin, host, token and resource bounds including shared APIs', async () => {
   const { request, token } = await fixture()
   await Promise.all(
     (
@@ -266,7 +270,7 @@ it('enforces origin, host, token and resource bounds while protecting legacy API
       ] as Record<string, string>[]
     ).map(async (headers) => {
       expect((await request('/api/session', { headers })).status).toBe(403)
-      expect((await request('/api/legacy', { method: 'POST', headers })).status).toBe(403)
+      expect((await request('/api/shared', { method: 'POST', headers })).status).toBe(403)
     }),
   )
   expect(
@@ -274,7 +278,7 @@ it('enforces origin, host, token and resource bounds while protecting legacy API
       .status,
   ).toBe(200)
   expect((await request('/api/threads', { method: 'POST' })).status).toBe(403)
-  expect((await request('/api/legacy', { method: 'POST' })).status).toBe(200)
+  expect((await request('/api/shared', { method: 'POST' })).status).toBe(200)
   expect(
     (
       await request('/api/threads', {
@@ -324,6 +328,168 @@ it('persists private ask/follow-up and drafts without source writes; refuses sta
   expect((await reopened.store.snapshot()).drafts[0]?.body).toBe('Archived edit')
   expect((await reopened.store.snapshot()).threads[0]?.turns).toHaveLength(2)
   expect(reopened.token).not.toBe((await (await request('/api/session')).json()).token)
+})
+
+it('forwards private proposal intent on both routes without creating drafts or writing files', async () => {
+  const { cwd, faux, open, request, mutate, store } = await fixture()
+  const revision = (await (await request('/api/review')).json()).revision
+  const anchor = { path: 'file.txt', side: 'RIGHT' as const, line: 1, revision }
+  const first = {
+    id: randomUUID(),
+    anchor,
+    intent: 'propose-change' as const,
+    text: 'Propose a single-line replacement',
+  }
+  const next = {
+    id: randomUUID(),
+    intent: 'propose-change' as const,
+    text: 'Propose a multi-file redesign instead',
+  }
+  const ask = vi.spyOn(store, 'ask')
+  const reply = vi.spyOn(store, 'reply')
+  const publish = vi.spyOn(github, 'publishReview')
+  faux.setResponses([
+    ...[first, next].map(
+      (input): FauxResponseFactory =>
+        (ctx) => {
+          const modelInput = JSON.stringify(
+            ctx.messages.findLast((message) => message.role === 'user'),
+          )
+          expect(modelInput).toContain('Intent: propose-change')
+          expect(modelInput.indexOf('Intent: propose-change')).toBeLessThan(
+            modelInput.indexOf(input.text),
+          )
+          expect(modelInput).toContain('never edit files')
+          expect(modelInput).toContain('A RIGHT anchor alone is not verification')
+          return fauxAssistantMessage('Private proposed change')
+        },
+    ),
+    (ctx) => {
+      const modelInput = JSON.stringify(
+        ctx.messages.findLast((message) => message.role === 'user'),
+      )
+      expect(modelInput).toContain('Intent: question')
+      expect(modelInput).not.toContain('Provide a concrete, minimal proposed code change')
+      return fauxAssistantMessage('Ordinary answer')
+    },
+  ])
+  expect((await mutate('/api/threads', first)).status).toBe(200)
+  await expect
+    .poll(async () => (await store.snapshot()).threads[0]?.status)
+    .toBe('answered')
+  expect(ask).toHaveBeenCalledWith({
+    ...first,
+    context: expect.stringContaining('Selected excerpt'),
+  })
+  expect((await mutate(`/api/threads/${first.id}/messages`, next)).status).toBe(200)
+  await expect
+    .poll(async () => (await store.snapshot()).threads[0]?.turns[1]?.answer)
+    .toBe('Private proposed change')
+  expect(reply).toHaveBeenCalledWith(first.id, {
+    ...next,
+    context: expect.stringContaining('Selected excerpt'),
+  })
+  const ordinary = { id: randomUUID(), text: 'Explain the tradeoff' }
+  expect((await mutate(`/api/threads/${first.id}/messages`, ordinary)).status).toBe(200)
+  await expect
+    .poll(async () => (await store.snapshot()).threads[0]?.turns[2]?.answer)
+    .toBe('Ordinary answer')
+  expect((await store.snapshot()).drafts).toEqual([])
+  expect((await store.snapshot()).publication).toBeNull()
+  expect(publish).not.toHaveBeenCalled()
+  expect(await readFile(join(cwd, 'file.txt'), 'utf8')).toBe('after\n')
+  await store.close()
+  const reopened = await open()
+  expect(
+    (await reopened.store.snapshot()).threads[0]?.turns.map((turn) => turn.intent),
+  ).toEqual(['propose-change', 'propose-change', 'question'])
+})
+
+it('rejects invalid intents and stale proposal anchors on both routes', async () => {
+  const { cwd, faux, request, mutate, store } = await fixture()
+  const revision = (await (await request('/api/review')).json()).revision
+  const first = {
+    id: randomUUID(),
+    anchor: { path: 'file.txt', side: 'RIGHT', line: 1, revision },
+    text: 'Propose a change',
+    intent: 'propose-change',
+  }
+  const ask = vi.spyOn(store, 'ask')
+  const reply = vi.spyOn(store, 'reply')
+  expect((await mutate('/api/threads', { ...first, intent: 'edit' })).status).toBe(400)
+  expect(ask).not.toHaveBeenCalled()
+  expect(
+    (
+      await request('/api/threads', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(first),
+      })
+    ).status,
+  ).toBe(403)
+  expect((await mutate('/api/threads', first)).status).toBe(200)
+  await expect
+    .poll(async () => (await store.snapshot()).threads[0]?.status)
+    .toBe('answered')
+  expect(
+    (
+      await mutate(`/api/threads/${first.id}/messages`, {
+        id: randomUUID(),
+        text: 'Invalid follow-up',
+        intent: 'publish',
+      })
+    ).status,
+  ).toBe(400)
+  expect(reply).not.toHaveBeenCalled()
+  await writeFile(join(cwd, 'file.txt'), 'changed\n')
+  expect((await mutate('/api/threads', { ...first, id: randomUUID() })).status).toBe(409)
+  expect(
+    (
+      await mutate(`/api/threads/${first.id}/messages`, {
+        id: randomUUID(),
+        text: 'Stale proposal',
+        intent: 'propose-change',
+      })
+    ).status,
+  ).toBe(409)
+  expect(reply).not.toHaveBeenCalled()
+  expect(ask).toHaveBeenCalledTimes(1)
+  expect(faux.state.callCount).toBe(1)
+})
+
+it('returns a conflict for changed intent, text or target under an existing request ID', async () => {
+  const { request, mutate, store, faux } = await fixture()
+  const revision = (await (await request('/api/review')).json()).revision
+  const first = {
+    id: randomUUID(),
+    anchor: { path: 'file.txt', side: 'RIGHT', line: 1, revision },
+    text: 'Propose a change',
+    intent: 'propose-change',
+  }
+  expect((await mutate('/api/threads', first)).status).toBe(200)
+  await expect
+    .poll(async () => (await store.snapshot()).threads[0]?.status)
+    .toBe('answered')
+  expect((await mutate('/api/threads', first)).status).toBe(200)
+  expect((await mutate('/api/threads', { ...first, intent: undefined })).status).toBe(409)
+  expect((await mutate('/api/threads', { ...first, text: 'Something else' })).status).toBe(
+    409,
+  )
+  expect(
+    (await mutate('/api/threads', { ...first, anchor: { ...first.anchor, side: 'LEFT' } }))
+      .status,
+  ).toBe(409)
+  const followup = { id: randomUUID(), text: 'Why?' }
+  const path = `/api/threads/${first.id}/messages`
+  expect((await mutate(path, followup)).status).toBe(200)
+  await expect
+    .poll(async () => (await store.snapshot()).threads[0]?.turns[1]?.answer)
+    .toBe('Follow-up')
+  expect((await mutate(path, { ...followup, intent: 'question' })).status).toBe(200)
+  expect((await mutate(path, { ...followup, intent: 'propose-change' })).status).toBe(409)
+  expect((await mutate(path, { ...followup, text: 'Changed' })).status).toBe(409)
+  expect((await store.snapshot()).threads[0]?.turns).toHaveLength(2)
+  expect(faux.state.callCount).toBe(2)
 })
 
 const testPr: PullRequest = {
@@ -410,41 +576,45 @@ it.each(['absent', 'found', 'offline'] as const)(
   },
 )
 
-it('provider confirmation names the current target and cannot implicitly send a follow-up', async () => {
-  const { mutate, store } = await fixture()
-  const threadId = randomUUID()
-  vi.spyOn(store, 'snapshot').mockResolvedValue({
-    drafts: [],
-    publication: null,
-    threads: [
-      {
-        id: threadId,
-        anchor: { path: 'file.txt', side: 'RIGHT', line: 1, revision: 'old' },
-        turns: [],
-        status: 'failed',
-        resolved: false,
-        providerChange: { from: 'previous', to: 'faux' },
-      },
-    ],
-  })
-  const confirm = vi.spyOn(store, 'confirmProvider').mockResolvedValue()
-  const reply = vi.spyOn(store, 'reply')
-  expect(
-    (
-      await mutate(`/api/threads/${threadId}/messages`, {
-        id: randomUUID(),
-        text: 'Follow up',
-      })
-    ).status,
-  ).toBe(409)
-  expect(reply).not.toHaveBeenCalled()
-  expect(
-    (await mutate(`/api/threads/${threadId}/provider`, { provider: 'wrong' })).status,
-  ).toBe(409)
-  expect(confirm).not.toHaveBeenCalled()
-  expect(
-    (await mutate(`/api/threads/${threadId}/provider`, { provider: 'faux' })).status,
-  ).toBe(200)
-  expect(confirm).toHaveBeenCalledExactlyOnceWith(threadId, 'faux')
-  expect(reply).not.toHaveBeenCalled()
-})
+it.each(['question', 'propose-change'] as const)(
+  'provider confirmation cannot implicitly send a %s follow-up',
+  async (intent) => {
+    const { mutate, store } = await fixture()
+    const threadId = randomUUID()
+    vi.spyOn(store, 'snapshot').mockResolvedValue({
+      drafts: [],
+      publication: null,
+      threads: [
+        {
+          id: threadId,
+          anchor: { path: 'file.txt', side: 'RIGHT', line: 1, revision: 'old' },
+          turns: [],
+          status: 'failed',
+          resolved: false,
+          providerChange: { from: 'previous', to: 'faux' },
+        },
+      ],
+    })
+    const confirm = vi.spyOn(store, 'confirmProvider').mockResolvedValue()
+    const reply = vi.spyOn(store, 'reply')
+    expect(
+      (
+        await mutate(`/api/threads/${threadId}/messages`, {
+          id: randomUUID(),
+          text: 'Follow up',
+          intent,
+        })
+      ).status,
+    ).toBe(409)
+    expect(reply).not.toHaveBeenCalled()
+    expect(
+      (await mutate(`/api/threads/${threadId}/provider`, { provider: 'wrong' })).status,
+    ).toBe(409)
+    expect(confirm).not.toHaveBeenCalled()
+    expect(
+      (await mutate(`/api/threads/${threadId}/provider`, { provider: 'faux' })).status,
+    ).toBe(200)
+    expect(confirm).toHaveBeenCalledExactlyOnceWith(threadId, 'faux')
+    expect(reply).not.toHaveBeenCalled()
+  },
+)

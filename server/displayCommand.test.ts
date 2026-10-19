@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest'
 import type { DiffArgs } from '../shared/types.ts'
 import { displayCommand } from './displayCommand.ts'
 
-const base = { commentsEnabled: true, files: [], endpoints: null }
+const base = { files: [], endpoints: null }
 
 describe('displayCommand', () => {
   it('leaves plain args unquoted', () => {

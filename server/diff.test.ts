@@ -14,7 +14,7 @@ import type { DiffArgs } from '../shared/types.ts'
 import { diffCommand } from './diff.ts'
 import { isolateVcsConfig, requireJj, run } from './testUtil.ts'
 
-const base = { commentsEnabled: true, files: [], endpoints: null }
+const base = { files: [], endpoints: null }
 
 const home = await isolateVcsConfig()
 afterAll(async () => {

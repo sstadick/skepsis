@@ -1,0 +1,328 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, you can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * Copyright Oxide Computer Company
+ */
+
+/* Keep the global header outside both independent scrolling panes. Every flex
+   boundary must shrink so CodeView, not the page, owns the diff's scrolling. */
+.review-workspace {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+  max-width: 2060px;
+  margin: 0 auto;
+  padding-top: 12px;
+  gap: 12px;
+  box-sizing: border-box;
+}
+
+.review-workspace > .header-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 0 12px;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.review-workspace .progress-bar {
+  flex: 1 1 400px;
+  flex-wrap: wrap;
+  min-width: 0;
+  padding: 0;
+  gap: 8px;
+}
+
+.review-workspace-body {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.review-workspace .diff-container {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  width: auto;
+  max-width: none;
+  padding-top: 0;
+  margin: 0;
+}
+
+.review-workspace .codeview-root {
+  min-width: 0;
+}
+
+.file-sidebar {
+  flex: 0 0 260px;
+  width: 260px;
+  min-width: 0;
+  min-height: 0;
+  box-sizing: border-box;
+  border-right: 1px solid var(--border-soft);
+  background: var(--bg-panel);
+  color: var(--fg);
+  font-size: 12px;
+}
+
+.file-sidebar:not([hidden]) {
+  display: flex;
+  flex-direction: column;
+}
+
+.file-sidebar-heading {
+  padding: 10px 12px 0;
+  font-weight: 600;
+  color: var(--fg-bright);
+}
+
+.file-sidebar-filter {
+  padding: 8px 12px;
+}
+
+.file-sidebar-filter label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--fg-muted);
+}
+
+.file-sidebar-filter input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--bg-code);
+  color: var(--fg);
+  font: inherit;
+}
+
+.file-sidebar-toggle {
+  padding: 5px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-control);
+  color: var(--fg-bright);
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.file-sidebar-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding: 0 4px 12px;
+}
+
+.file-sidebar-list ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.file-sidebar-file,
+.file-sidebar-folder {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.file-sidebar-folder {
+  font-weight: 500;
+}
+
+.file-sidebar-file:hover,
+.file-sidebar-folder:hover,
+.file-sidebar-toggle:hover {
+  background: var(--bg-control-hover);
+}
+
+.file-sidebar-file[aria-current='true'] {
+  background: var(--bg-control);
+  border-color: var(--border-strong);
+  color: var(--fg-bright);
+}
+
+/* A consistent 8% accent tint and an inset bar make priorities scannable
+   without replacing file names, A/M/D/R colors, viewed state, or focus rings. */
+.file-sidebar-file[data-level],
+.file-sidebar-folder[data-level] {
+  box-shadow: inset 3px 0 var(--priority-color);
+  background: color-mix(in oklch, var(--priority-color) 8%, var(--bg-panel));
+}
+
+.file-sidebar-file[data-level]:hover,
+.file-sidebar-folder[data-level]:hover {
+  background: color-mix(in oklch, var(--priority-color) 12%, var(--bg-control-hover));
+}
+
+.file-sidebar-file[data-level][aria-current='true'] {
+  background: color-mix(in oklch, var(--priority-color) 16%, var(--bg-control));
+  border-color: var(--border-strong);
+  font-weight: 600;
+}
+
+.file-sidebar-priority {
+  flex-shrink: 0;
+  padding: 1px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-code);
+  color: var(--priority-color);
+  font: 10px/1.5 var(--font-mono);
+}
+
+.file-sidebar-priority-key {
+  flex-shrink: 0;
+  padding: 0 12px 8px;
+  color: var(--fg-muted);
+  font-size: 11px;
+  max-height: 100px;
+  overflow: auto;
+}
+.file-sidebar-priority-key summary {
+  cursor: pointer;
+}
+.file-sidebar-priority-key > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.file-sidebar-priority-key .priority-tone {
+  color: var(--priority-color);
+}
+.file-sidebar-priority-key .priority-tone::before {
+  content: '●';
+  margin-right: 3px;
+}
+.file-sidebar-priority-key p {
+  margin: 6px 0 0;
+}
+
+.file-sidebar button:focus-visible,
+.file-sidebar input:focus-visible,
+.file-sidebar-toggle:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+}
+
+.file-sidebar-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-sidebar-chevron,
+.file-sidebar-viewed {
+  width: 12px;
+  flex-shrink: 0;
+  color: var(--fg-muted);
+  text-align: center;
+}
+
+.file-sidebar-viewed.viewed {
+  color: var(--blue-text);
+}
+
+.file-sidebar-viewed.stale {
+  color: var(--amber);
+}
+
+.file-sidebar-change {
+  flex-shrink: 0;
+  font: 11px var(--font-mono);
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+
+.file-sidebar-change.change-A {
+  color: var(--green-text);
+}
+
+.file-sidebar-change.change-D {
+  color: var(--red);
+}
+
+.file-sidebar-change.change-R {
+  color: var(--blue-text);
+}
+
+.file-sidebar-stats {
+  display: flex;
+  flex-shrink: 0;
+  gap: 3px;
+  font: 10px var(--font-mono);
+}
+
+.file-sidebar-empty {
+  padding: 0 8px;
+  color: var(--fg-muted);
+}
+
+@media (max-width: 760px) {
+  /* A bounded stacked drawer leaves the diff visible, without an overlay
+     trapping focus or covering the remaining viewport. */
+  .review-workspace-body {
+    flex-direction: column;
+  }
+
+  .file-sidebar {
+    flex: 0 0 180px;
+    max-height: 30%;
+    width: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-soft);
+  }
+
+  .file-sidebar-heading {
+    padding-top: 6px;
+  }
+
+  .file-sidebar-filter {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .file-sidebar-filter label {
+    flex-shrink: 0;
+    margin: 0;
+  }
+
+  .review-workspace .diff-command {
+    flex-basis: 100%;
+  }
+
+  .review-workspace .progress-track {
+    flex: 0 1 64px;
+  }
+}

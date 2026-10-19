@@ -9,9 +9,9 @@
 /* oxlint-disable no-await-in-loop -- Lock acquisition and ordered provider selection must be sequential. */
 /* oxlint-disable preserve-caught-error -- Credential errors must not retain secret-bearing causes. */
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import lockfile from 'proper-lockfile'
 import { createModels } from '@earendil-works/pi-ai/models'
@@ -188,6 +188,7 @@ type Setup = {
   model?: { provider: string; modelId: string }
   status: ReviewSnapshot['agent']
   classifierInstructions?: string
+  classifierConcurrency?: number
   toolPolicyKey?: string
 }
 
@@ -203,6 +204,23 @@ export async function setupReviewAgent(
   )
 }
 
+// Installing a data-only user config is a persistent opt-in. Never look in the
+// reviewed working directory or load executable Pi extensions to discover one.
+async function defaultClassifierConfig(env: NodeJS.ProcessEnv, home: string) {
+  const configHome =
+    env.XDG_CONFIG_HOME && isAbsolute(env.XDG_CONFIG_HOME)
+      ? env.XDG_CONFIG_HOME
+      : join(home, '.config')
+  const path = join(configHome, 'skepsis', 'classifier.json')
+  try {
+    await lstat(path)
+    return path
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw new Error('Cannot read the default classifier configuration')
+  }
+}
+
 /** Explicit environment/home injection keeps tests away from real user credentials. */
 export async function setupReviewAgentWithEnvironment(
   modelOption: string | false | undefined,
@@ -210,11 +228,16 @@ export async function setupReviewAgentWithEnvironment(
   home: string,
   classifierConfig?: string,
 ): Promise<Setup> {
-  // Explicit, server-side opt-in only: never discover executable config from a
-  // reviewed repository or inherit the launcher's classifier extensions.
-  const configPath = classifierConfig ?? env.SKEPSIS_CLASSIFIER_CONFIG
+  // Explicit paths win over the persistent user default; invalid selected
+  // config fails closed rather than falling back to a different endpoint.
+  const configPath =
+    modelOption === false
+      ? undefined
+      : (classifierConfig ??
+        env.SKEPSIS_CLASSIFIER_CONFIG ??
+        (await defaultClassifierConfig(env, home)))
   const classifier =
-    modelOption !== false && configPath !== undefined
+    configPath !== undefined
       ? await loadReviewClassifier(resolve(configPath.replace(/^~(?=\/|$)/, home)), env)
       : undefined
   const directory =
@@ -241,10 +264,11 @@ export async function setupReviewAgentWithEnvironment(
   models.setProvider({ ...openai, getAllModels: () => openai.getModels() })
   models.setProvider(openaiCodexProvider())
   result.status.codemode = true
-  result.toolPolicyKey = `review-codemode-v1:${classifier?.policyKey ?? 'no-classifier'}`
+  result.toolPolicyKey = `review-codemode-v2:${classifier?.policyKey ?? 'no-classifier'}`
   if (classifier) {
     models.setProvider(classifier.provider)
     result.status.classifier = classifier.summary
+    result.classifierConcurrency = classifier.concurrency
     result.classifierInstructions = `Configured decision model: models.getModelOfType("classifier", ${JSON.stringify(classifier.summary.provider)}, ${JSON.stringify(classifier.summary.model)}). ${classifier.instructions}`
   } else {
     result.classifierInstructions =

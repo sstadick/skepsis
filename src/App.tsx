@@ -55,6 +55,15 @@ import {
   bufferAnchors,
 } from './ReviewPanel.tsx'
 import type { ReviewAnchor } from '../shared/review.ts'
+import {
+  FileSidebar,
+  FileSidebarToggle,
+  sidebarFiles,
+  useFileSidebarOpen,
+} from './FileSidebar.tsx'
+import './fileSidebar.css'
+import { HunkPriorities, HunkPriorityNote, useHunkPriorities } from './HunkPriorities.tsx'
+import type { HunkPriority } from '../shared/priorities.ts'
 
 const queryClient = new QueryClient()
 
@@ -126,7 +135,12 @@ function useToast(duration = 1400) {
   return { toast, showToast }
 }
 
-type AnnotationMeta = { type: 'durable'; anchor: ReviewAnchor }
+type AnnotationMeta = {
+  type: 'review'
+  anchor: ReviewAnchor
+  conversation: boolean
+  priority?: HunkPriority
+}
 
 // In split mode the diffs library renders pure adds ('new') and pure deletes
 // ('deleted') as a single full-width column. We want them laid out like every
@@ -547,6 +561,7 @@ function topFileName(
 }
 
 function DiffView() {
+  const [filesOpen, setFilesOpen] = useFileSidebarOpen()
   const isWide = useIsWide()
   const [splitMode, setSplitMode] = useState<SplitMode>('responsive')
   const diffStyle: 'split' | 'unified' =
@@ -586,6 +601,8 @@ function DiffView() {
     queryKey: ['diff'],
     queryFn: () => apiFetch<DiffResponse>('/api/diff'),
   })
+  const priorities = useHunkPriorities(data?.reviewRevision, !!review.data)
+  const hunkPriorities = priorities.results
 
   useEffect(() => {
     if (composing && data?.reviewRevision && composing.revision !== data.reviewRevision)
@@ -624,6 +641,7 @@ function DiffView() {
     // catches anything missed while a reconnect was in flight).
     const refreshReview = () => {
       void qc.invalidateQueries({ queryKey: ['review'] })
+      void qc.invalidateQueries({ queryKey: ['priorities'] })
     }
     const reconnect = () => {
       refreshDiff()
@@ -631,11 +649,9 @@ function DiffView() {
     }
     events.addEventListener('thread-changed', refreshReview)
     events.addEventListener('open', reconnect)
-    events.addEventListener('review-changed', refreshDiff)
     return () => {
       events.removeEventListener('open', reconnect)
       events.removeEventListener('thread-changed', refreshReview)
-      events.removeEventListener('review-changed', refreshDiff)
       events.close()
     }
   }, [qc])
@@ -694,14 +710,15 @@ function DiffView() {
   // are "partial" diffs (no full-file context), used for initial paint and as
   // the fallback when full contents aren't available.
   const patch = data?.patch
-  const patchFiles = useMemo(
-    () =>
-      patch
-        ? parsePatchFiles(patch)
-            .flatMap((p) => p.files)
-            .map(normalizeFileType)
-        : [],
+  const originalPatchFiles = useMemo(
+    () => (patch ? parsePatchFiles(patch).flatMap((p) => p.files) : []),
     [patch],
+  )
+  // Keep the original change types for the sidebar badges. CodeView's split
+  // layout normalization must not turn added/deleted files into modified ones.
+  const patchFiles = useMemo(
+    () => originalPatchFiles.map((file) => normalizeFileType({ ...file })),
+    [originalPatchFiles],
   )
 
   // Hunk expansion needs "non-partial" diffs built from full file contents.
@@ -796,7 +813,7 @@ function DiffView() {
     })
   }, [patchFiles, contentsByFile, expandedFiles])
 
-  const commentsEnabled = !!review.data && !!data?.reviewRevision
+  const conversationsEnabled = !!review.data && !!data?.reviewRevision
 
   // Navigable lines per file for the j/k cursor: addition-side line numbers
   // (context + additions; deletions are skipped),
@@ -842,6 +859,11 @@ function DiffView() {
     unviewAllMutation.isPending,
     unviewAllMutation.variables,
   ])
+
+  const sidebarEntries = useMemo(
+    () => sidebarFiles(originalPatchFiles, data?.fileHashes ?? {}, viewed, hunkPriorities),
+    [originalPatchFiles, data?.fileHashes, viewed, hunkPriorities],
+  )
 
   const [showHelp, setShowHelp] = useState(false)
   const codeViewRef = useRef<CodeViewHandle<AnnotationMeta>>(null)
@@ -926,11 +948,25 @@ function DiffView() {
         }
         grouped.set(anchorKey(a), a)
       }
-      const annotations: DiffLineAnnotation<AnnotationMeta>[] = [...grouped.values()].map(
-        (anchor) => ({
+      // Merge the score with any conversation at the same line: CodeView's
+      // annotation slots are keyed by line/side, not by the feature using them.
+      const conversations = new Set(grouped.keys())
+      const byAnchor = new Map(
+        hunkPriorities
+          .filter((hunk) => hunk.path === name)
+          .map((hunk) => [anchorKey(hunk.anchor), hunk]),
+      )
+      for (const [key, hunk] of byAnchor) grouped.set(key, hunk.anchor)
+      const annotations: DiffLineAnnotation<AnnotationMeta>[] = [...grouped].map(
+        ([key, anchor]) => ({
           side: anchor.side === 'LEFT' ? 'deletions' : 'additions',
           lineNumber: anchor.line,
-          metadata: { type: 'durable', anchor },
+          metadata: {
+            type: 'review',
+            anchor,
+            conversation: conversations.has(key),
+            priority: byAnchor.get(key),
+          },
         }),
       )
       const isCollapsed = collapsed[name] ?? false
@@ -953,7 +989,16 @@ function DiffView() {
         version,
       }
     })
-  }, [files, data, composing, collapsed, expandedFiles, review.data, review.text])
+  }, [
+    files,
+    data,
+    composing,
+    collapsed,
+    expandedFiles,
+    review.data,
+    review.text,
+    hunkPriorities,
+  ])
   itemsRef.current = items
 
   // The header highlight falls back to the first file before any focus exists
@@ -971,6 +1016,7 @@ function DiffView() {
   // toggling collapse on a file whose top is at or above the viewport top,
   // record it here; after the items rebuild, re-anchor its header to the top.
   const pendingAnchorRef = useRef<string | null>(null)
+  const pendingLineRef = useRef<ReviewAnchor | null>(null)
   const anchorIfTopFile = useCallback((name: string) => {
     const top = codeViewRef.current?.getInstance()?.getTopForItem(name)
     if (top != null && top <= scrollTopRef.current + 4) {
@@ -979,6 +1025,21 @@ function DiffView() {
   }, [])
 
   useLayoutEffect(() => {
+    const anchor = pendingLineRef.current
+    if (anchor) {
+      pendingLineRef.current = null
+      pendingAnchorRef.current = null
+      markProgrammaticScroll()
+      codeViewRef.current?.scrollTo({
+        type: 'line',
+        id: anchor.path,
+        lineNumber: anchor.line,
+        side: anchor.side === 'LEFT' ? 'deletions' : 'additions',
+        align: 'center',
+        behavior: 'instant',
+      })
+      return
+    }
     const name = pendingAnchorRef.current
     if (!name) return
     pendingAnchorRef.current = null
@@ -990,6 +1051,37 @@ function DiffView() {
       behavior: 'instant',
     })
   }, [items, markProgrammaticScroll])
+
+  const selectSidebarFile = useCallback(
+    (name: string) => {
+      setFocused(name)
+      const lines = fileLines.get(name)
+      setCursor(lines?.length ? { file: name, line: lines[0]! } : null)
+      markProgrammaticScroll()
+      if (collapsed[name]) {
+        // Scroll after CodeView receives the expanded item, using the same
+        // post-layout anchoring as file-header collapse. Never mark it viewed.
+        pendingAnchorRef.current = name
+        setCollapsed((previous) => ({ ...previous, [name]: false }))
+      } else {
+        codeViewRef.current?.scrollTo({ type: 'item', id: name, align: 'start' })
+      }
+    },
+    [collapsed, fileLines, markProgrammaticScroll, setFocused],
+  )
+
+  const selectPriorityHunk = useCallback(
+    (anchor: ReviewAnchor) => {
+      if (anchor.revision !== data?.reviewRevision) return
+      setFocused(anchor.path)
+      setCursor(anchor.side === 'RIGHT' ? { file: anchor.path, line: anchor.line } : null)
+      pendingLineRef.current = anchor
+      // Even an already-open file gets a layout pass so navigation happens
+      // after the ranked list closes, without marking the file viewed.
+      setCollapsed((previous) => ({ ...previous, [anchor.path]: false }))
+    },
+    [data?.reviewRevision, setFocused],
+  )
 
   // Render the cursor through CodeView's native line selection. Re-applied on
   // items changes too because a version bump re-renders the item's element,
@@ -1076,35 +1168,70 @@ function DiffView() {
       const meta = annotation.metadata
       if (!meta) return null
       return (
-        <LineChat
-          anchor={meta.anchor}
-          review={review}
-          composing={
-            composing?.file === meta.anchor.path &&
-            composing.line === meta.anchor.line &&
-            composing.side === meta.anchor.side &&
-            composing.revision === meta.anchor.revision
-          }
-          onClose={() => setComposing(null)}
-        />
+        <>
+          {meta.priority && (
+            <HunkPriorityNote
+              hunk={meta.priority}
+              onDiscuss={() => {
+                review.focusComposer.current = anchorKey(meta.anchor)
+                setComposing({
+                  file: meta.anchor.path,
+                  line: meta.anchor.line,
+                  side: meta.anchor.side,
+                  revision: meta.anchor.revision,
+                })
+              }}
+            />
+          )}
+          {meta.conversation && (
+            <LineChat
+              anchor={meta.anchor}
+              review={review}
+              composing={
+                composing?.file === meta.anchor.path &&
+                composing.line === meta.anchor.line &&
+                composing.side === meta.anchor.side &&
+                composing.revision === meta.anchor.revision
+              }
+              onClose={() => setComposing(null)}
+            />
+          )}
+        </>
       )
     },
     [review, composing],
   )
 
-  // Gutter-utility click (start a comment). Routed through a ref so the
-  // CodeView options object can stay stable across renders.
+  const releaseKeyboardCursor = useCallback(() => {
+    if (!cursorRef.current) return
+    // Native selection pins the + to the selected range. Once the mouse takes
+    // over, clear that keyboard/sidebar highlight so + follows the hovered line.
+    // Do it synchronously: a pointer-down may precede React's next effect.
+    cursorRef.current = null
+    codeViewRef.current?.getInstance()?.clearSelectedLines({ notify: false })
+    setCursor(null)
+  }, [])
+
+  // Both direct line-number clicks and the hover + open the line composer.
+  // Route through a ref so CodeView's options stay stable across streamed updates.
   const gutterClickRef = useRef<
     (range: SelectedLineRange, item: CodeViewItem<AnnotationMeta>) => void
   >(() => {})
   gutterClickRef.current = (range, item) => {
     if (!review.data || !data?.reviewRevision) return
-    review.focusComposer.current = anchorKey({
+    releaseKeyboardCursor()
+    const key = anchorKey({
       path: item.id,
       line: range.start,
       side: range.side === 'deletions' ? 'LEFT' : 'RIGHT',
       revision: data.reviewRevision,
     })
+    review.focusComposer.current = key
+    // Reopening a line means editing, even if its preserved buffer was last
+    // previewed. Keep its text/mode; never replace or send it on a gutter click.
+    review.setPreviews((previous) =>
+      previous[key] ? { ...previous, [key]: false } : previous,
+    )
     setComposing({
       file: item.id,
       line: range.start,
@@ -1141,9 +1268,19 @@ function DiffView() {
       // emits inside its header region — and disableFileHeader removes that region
       // entirely, so the slot never exists and the portal has nowhere to land.
       stickyHeaders: true,
-      enableGutterUtility: commentsEnabled,
+      enableGutterUtility: conversationsEnabled,
       unsafeCSS: EXPAND_PLACEHOLDER_CSS,
       onGutterUtilityClick: (range, context) => gutterClickRef.current(range, context.item),
+      onLineEnter: conversationsEnabled ? releaseKeyboardCursor : undefined,
+      onLineNumberClick: conversationsEnabled
+        ? (line, context) => {
+            if (line.type !== 'diff-line') return
+            gutterClickRef.current(
+              { start: line.lineNumber, end: line.lineNumber, side: line.annotationSide },
+              context.item,
+            )
+          }
+        : undefined,
       onPostRender: (node, instance, phase, context) => {
         if (phase === 'unmount') return
         // Mark the file seen so its full contents get fetched for expansion.
@@ -1168,7 +1305,7 @@ function DiffView() {
         }
       },
     }),
-    [theme, diffStyle, commentsEnabled, markSeen],
+    [theme, diffStyle, conversationsEnabled, markSeen, releaseKeyboardCursor],
   )
 
   // Keyboard shortcuts. File navigation (n/p) and the focused-file actions
@@ -1447,49 +1584,67 @@ function DiffView() {
   const { fileHashes } = data
 
   return (
-    <>
-      <div className="diff-container">
-        {/* Wrapper is the positioning context for the toast, which floats
-            centered over the header bar without participating in its flex row
-            (the bar's two sides can meet on narrow viewports). */}
-        <div className="header-row">
-          <ProgressBar
-            command={data.revset}
-            fileHashes={fileHashes}
-            viewed={viewed}
-            theme={theme}
-            onCycleTheme={cycleTheme}
-            onUnviewAll={() => {
-              const entries = Object.entries(viewed).map(([file, hash]) => ({ file, hash }))
-              if (entries.length === 0) return
-              // Mirror single-file unview, which also opens the file.
-              setCollapsed((prev) => {
-                const next = { ...prev }
-                for (const { file } of entries) next[file] = false
-                return next
-              })
-              unviewAllMutation.mutate(entries)
-            }}
-          />
-          {toast && (
-            <div className="toast" key={toast.key}>
-              {toast.content}
-            </div>
-          )}
-        </div>
-        <ReviewPanel review={review} />
-        {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
-        <CodeView
-          ref={codeViewRef}
-          className="codeview-root"
-          items={items}
-          options={options}
-          onScroll={onScroll}
-          renderCustomHeader={renderCustomHeader}
-          renderAnnotation={renderAnnotation}
+    <div className="review-workspace">
+      {/* Global header stays visible when the left file panel is closed. */}
+      <div className="header-row">
+        <FileSidebarToggle
+          open={filesOpen}
+          onToggle={() => setFilesOpen((open) => !open)}
         />
+        <ProgressBar
+          command={data.revset}
+          fileHashes={fileHashes}
+          viewed={viewed}
+          theme={theme}
+          onCycleTheme={cycleTheme}
+          onUnviewAll={() => {
+            const entries = Object.entries(viewed).map(([file, hash]) => ({ file, hash }))
+            if (entries.length === 0) return
+            // Mirror single-file unview, which also opens the file.
+            setCollapsed((prev) => {
+              const next = { ...prev }
+              for (const { file } of entries) next[file] = false
+              return next
+            })
+            unviewAllMutation.mutate(entries)
+          }}
+        />
+        {toast && (
+          <div className="toast" key={toast.key}>
+            {toast.content}
+          </div>
+        )}
       </div>
-    </>
+      <div className="review-workspace-body">
+        <FileSidebar
+          files={sidebarEntries}
+          focusedFile={effectiveFocused}
+          open={filesOpen}
+          onSelect={selectSidebarFile}
+        />
+        <main className="diff-container">
+          {review.data && data.reviewRevision && (
+            <HunkPriorities
+              priorities={priorities}
+              revision={data.reviewRevision}
+              classifier={review.data.agent.classifier}
+              onNavigate={selectPriorityHunk}
+            />
+          )}
+          <ReviewPanel review={review} />
+          {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
+          <CodeView
+            ref={codeViewRef}
+            className="codeview-root"
+            items={items}
+            options={options}
+            onScroll={onScroll}
+            renderCustomHeader={renderCustomHeader}
+            renderAnnotation={renderAnnotation}
+          />
+        </main>
+      </div>
+    </div>
   )
 }
 

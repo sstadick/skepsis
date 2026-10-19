@@ -1,0 +1,163 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, you can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * Copyright Oxide Computer Company
+ */
+
+/* One palette for sidebar file/folder rows, the key, and inline hunk badges.
+   All accents reuse the shared OKLCH text tokens, including in light mode. */
+.priority-tone {
+  --priority-color: var(--fg-muted);
+}
+.priority-tone[data-level='low'] {
+  --priority-color: var(--green-text);
+}
+.priority-tone[data-level='normal'] {
+  --priority-color: var(--blue-text);
+}
+.priority-tone[data-level='high'] {
+  --priority-color: var(--amber);
+}
+.priority-tone[data-level='critical'] {
+  --priority-color: var(--red);
+}
+
+.hunk-priorities {
+  min-width: 0;
+  flex-shrink: 0;
+  max-height: 28vh;
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  color: var(--fg);
+  font:
+    12px/1.5 system-ui,
+    sans-serif;
+}
+
+.hunk-priority-toolbar,
+.hunk-priority-note {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+}
+
+.hunk-priority-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-panel);
+}
+
+.hunk-priority-status {
+  flex: 1;
+  color: var(--fg-muted);
+}
+
+.hunk-priorities button,
+.hunk-priority-note button {
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-control);
+  color: var(--fg);
+  padding: 5px 9px;
+  min-height: 30px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.hunk-priorities button:hover:not(:disabled),
+.hunk-priority-note button:hover:not(:disabled) {
+  background: var(--bg-control-hover);
+}
+
+.hunk-priorities button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.hunk-priorities button:focus-visible,
+.hunk-priority-note button:focus-visible {
+  outline: 2px solid var(--blue-text);
+  outline-offset: 2px;
+}
+
+.hunk-priority-help,
+.hunk-priorities > p {
+  margin: 8px 12px;
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
+}
+
+.hunk-priorities [role='alert'] {
+  color: var(--red);
+}
+
+.hunk-priority-list {
+  list-style: none;
+  padding: 0 8px 8px;
+  margin: 0;
+}
+
+.hunk-priority-list button {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  width: 100%;
+  margin: 4px 0;
+  text-align: left;
+  background: var(--bg-code);
+  border-color: var(--border-soft);
+  overflow-wrap: anywhere;
+}
+
+.hunk-priority-path {
+  min-width: 0;
+  flex: 1 1 160px;
+  font-family: var(--font-mono);
+}
+
+.hunk-priority-path > span,
+.hunk-priority-label,
+.hunk-priority-confidence {
+  color: var(--fg-muted);
+}
+
+.hunk-priority-confidence[data-uncertain] {
+  color: var(--amber);
+}
+
+.hunk-priority-badge {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-muted);
+  color: var(--priority-color);
+  font: 11px/1.6 var(--font-mono);
+}
+
+.hunk-priority-note {
+  min-width: 0;
+  margin: 6px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--bg-panel);
+  color: var(--fg-muted);
+  font:
+    12px/1.5 system-ui,
+    sans-serif;
+  overflow-wrap: anywhere;
+}
+
+.hunk-priority-note button {
+  margin-inline-start: auto;
+}

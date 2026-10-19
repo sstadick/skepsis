@@ -1,0 +1,646 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, you can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * Copyright Oxide Computer Company
+ */
+
+/* Review chrome follows styles.css's shared OKLCH elevation and accent tokens. */
+.durable-review-panel,
+.durable-line-chat {
+  box-sizing: border-box;
+  min-width: 0;
+  background: var(--bg-panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  font:
+    13px/1.6 system-ui,
+    -apple-system,
+    sans-serif;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.durable-review-panel {
+  flex-shrink: 0;
+  max-height: 60vh;
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.durable-line-chat {
+  margin: 8px;
+}
+
+:where(.durable-review-panel, .durable-line-chat) p {
+  margin: 10px 0;
+}
+
+:where(.durable-review-panel, .durable-line-chat) h3 {
+  font-size: 14px;
+  color: var(--fg-bright);
+  margin: 0 0 12px;
+}
+
+:where(.durable-review-panel, .durable-line-chat, .review-markdown) button,
+:where(.durable-review-panel, .durable-line-chat) select {
+  box-sizing: border-box;
+  min-height: 32px;
+  padding: 5px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-control);
+  color: var(--fg);
+  font: inherit;
+  font-weight: 500;
+  line-height: 1.4;
+  cursor: pointer;
+  max-width: 100%;
+}
+
+:where(.durable-review-panel, .durable-line-chat, .review-markdown)
+  button:hover:not(:disabled) {
+  background: var(--bg-control-hover);
+  border-color: var(--border-muted);
+  color: var(--fg-bright);
+}
+
+:where(.durable-review-panel, .durable-line-chat, .review-markdown) button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+:where(.durable-review-panel, .durable-line-chat, .review-markdown)
+  :is(button, select, textarea, a, summary, input, [tabindex]):focus-visible {
+  outline: 2px solid var(--blue-text);
+  outline-offset: 3px;
+}
+
+:where(.durable-review-panel, .durable-line-chat) textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 112px;
+  resize: vertical;
+  margin: 8px 0;
+  padding: 12px;
+  background: var(--bg-code);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  font: 13px/1.65 var(--font-mono);
+  tab-size: 2;
+}
+
+:where(.durable-review-panel, .durable-line-chat) textarea::placeholder {
+  color: var(--fg-muted);
+}
+
+:where(.durable-review-panel, .durable-line-chat) a {
+  color: var(--blue-text);
+  text-underline-offset: 3px;
+}
+
+:where(.durable-review-panel, .durable-line-chat) [role='alert'] {
+  color: var(--red);
+}
+
+.review-line-header,
+.review-thread-header,
+.review-message-header,
+.review-editor-toolbar,
+.review-composer-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.review-line-header {
+  justify-content: space-between;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.review-location {
+  min-width: 0;
+  font: 12px/1.5 var(--font-mono);
+  color: var(--fg-bright);
+}
+
+.review-location > span,
+.review-hint {
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.review-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--bg-muted);
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.6;
+  text-transform: capitalize;
+}
+
+.review-pill[data-tone='warning'] {
+  color: var(--amber);
+}
+
+.review-pill[data-tone='success'] {
+  color: var(--green-text);
+}
+
+.durable-thread,
+.review-draft,
+.review-composer {
+  margin-top: 20px;
+}
+
+.durable-thread + .durable-thread,
+.review-draft,
+.review-composer {
+  border-top: 1px solid var(--border-soft);
+  padding-top: 16px;
+}
+
+.review-thread-header {
+  margin-bottom: 14px;
+  color: var(--fg-bright);
+}
+
+.review-timeline,
+.review-turn {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.review-timeline {
+  gap: 24px;
+}
+
+.review-message {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.review-avatar {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-header);
+  color: var(--fg-dim);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  user-select: none;
+}
+
+.review-message-agent .review-avatar {
+  color: var(--blue-text);
+}
+
+.review-message-card {
+  min-width: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 3px 10px 10px;
+  padding: 12px 14px;
+  background: var(--bg-muted);
+}
+
+.review-message-agent .review-message-card {
+  background: var(--bg-code);
+  border-color: var(--border);
+}
+
+.review-message-header {
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.review-message-header strong {
+  color: var(--fg-bright);
+}
+
+.review-message-header > span {
+  color: var(--fg-muted);
+}
+
+.durable-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 0;
+}
+
+.review-answer-actions {
+  border-top: 1px solid var(--border-soft);
+  padding-top: 12px;
+}
+
+.review-follow-up {
+  margin: 16px 0 0 38px;
+}
+
+.review-follow-up textarea {
+  min-height: 80px;
+}
+
+.review-editor-toolbar {
+  justify-content: space-between;
+  margin-top: 12px;
+}
+
+.review-composer-heading {
+  justify-content: space-between;
+}
+
+.review-segments {
+  box-sizing: border-box;
+  display: inline-flex;
+  flex-wrap: wrap;
+  max-width: 100%;
+  padding: 3px;
+  gap: 3px;
+  background: var(--bg-muted);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+}
+
+.review-segments button {
+  background: transparent;
+  border-color: transparent;
+  min-height: 28px;
+  padding: 4px 10px;
+  color: var(--fg-muted);
+}
+
+.review-segments button[aria-pressed='true'] {
+  background: var(--bg-code);
+  border-color: var(--border);
+  color: var(--blue-text);
+}
+
+.review-mode-select {
+  display: none;
+}
+
+.durable-actions button.review-primary,
+.durable-actions button.review-primary:hover:not(:disabled) {
+  border-color: var(--blue-text);
+  color: var(--blue-text);
+}
+
+.review-notice,
+.review-consent {
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-inline-start: 3px solid var(--blue-text);
+  border-radius: 6px;
+  background: var(--bg-muted);
+  color: var(--fg-dim);
+  font-size: 12px;
+}
+
+.review-consent {
+  margin-top: 14px;
+  border-inline-start-color: var(--amber);
+}
+
+/* Do not let shared editor display rules expose the inactive write pane. */
+.review-editor-input[hidden] {
+  display: none;
+}
+
+.review-editor-preview {
+  min-height: 112px;
+  box-sizing: border-box;
+  padding: 12px;
+  margin: 8px 0;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.review-streaming {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.review-streaming-dots {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.review-streaming-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--blue-text);
+  animation: review-pulse 1.4s ease-in-out infinite;
+}
+
+.review-streaming-dots i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.review-streaming-dots i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes review-pulse {
+  0%,
+  80%,
+  100% {
+    opacity: 0.35;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+
+.review-panel-heading {
+  color: var(--fg-bright);
+  font-weight: 600;
+}
+
+.review-panel-heading .review-pill {
+  margin-left: 6px;
+}
+
+.durable-review-panel summary {
+  cursor: pointer;
+}
+
+.review-archive {
+  margin: 12px 0;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.draft-selection {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px;
+  margin: 6px 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--bg-code);
+  cursor: pointer;
+}
+
+.draft-selection input {
+  flex-shrink: 0;
+}
+:where(.durable-review-panel, .review-markdown) input {
+  accent-color: var(--blue);
+}
+
+.review-publication-composer {
+  margin-top: 20px;
+}
+.review-outcome {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.publication-preview {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid var(--blue-text);
+  border-radius: 8px;
+  background: var(--bg-code);
+}
+
+.publication-preview article {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+.publication-preview article > strong {
+  display: block;
+  margin-bottom: 8px;
+  font: 12px/1.6 var(--font-mono);
+}
+
+/* Markdown is presentation only. Editors and API payloads always retain source. */
+.review-markdown {
+  /* Inline chats are slotted into CodeView's preformatted diff. Do not let
+     inherited whitespace turn Markdown's inter-block newlines into blank rows;
+     fenced code restores white-space: pre below. */
+  white-space: normal;
+  min-width: 0;
+  color: var(--fg);
+  font:
+    13px/1.7 system-ui,
+    -apple-system,
+    sans-serif;
+  overflow-wrap: anywhere;
+}
+
+.review-markdown > :first-child {
+  margin-top: 0;
+}
+.review-markdown > :last-child {
+  margin-bottom: 0;
+}
+.review-markdown p {
+  margin: 10px 0;
+}
+.review-markdown :is(h1, h2, h3, h4, h5, h6) {
+  color: var(--fg-bright);
+  margin: 18px 0 8px;
+  line-height: 1.4;
+  font-weight: 600;
+}
+.review-markdown h1 {
+  font-size: 1.4em;
+}
+.review-markdown h2 {
+  font-size: 1.25em;
+}
+.review-markdown :is(h3, h4, h5, h6) {
+  font-size: 1.1em;
+}
+.review-markdown :is(ul, ol) {
+  padding-left: 24px;
+  margin: 10px 0;
+}
+.review-markdown li + li {
+  margin-top: 4px;
+}
+.review-markdown li > p {
+  margin: 6px 0;
+}
+.review-markdown blockquote {
+  margin: 12px 0;
+  padding: 2px 12px;
+  border-left: 3px solid var(--border-strong);
+  color: var(--fg-dim);
+}
+.review-markdown hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 18px 0;
+}
+.review-markdown a {
+  color: var(--blue-text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.review-markdown :not(pre) > code {
+  padding: 2px 5px;
+  background: var(--bg-muted);
+  border-radius: 4px;
+  font: 0.92em/1.6 var(--font-mono);
+  white-space: break-spaces;
+}
+.review-markdown .contains-task-list {
+  padding-left: 4px;
+  list-style: none;
+}
+.review-markdown .task-list-item > input {
+  margin-right: 8px;
+}
+
+.review-image-placeholder {
+  color: var(--fg-muted);
+  font-style: italic;
+}
+.review-table-scroll {
+  max-width: 100%;
+  overflow: auto;
+  margin: 12px 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.review-table-scroll table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.review-table-scroll :is(th, td) {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  text-align: left;
+}
+.review-table-scroll th {
+  background: var(--bg-header);
+  color: var(--fg-bright);
+}
+.review-table-scroll tr:last-child td {
+  border-bottom: 0;
+}
+
+.review-code-panel {
+  min-width: 0;
+  margin: 12px 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+  background: var(--bg-code);
+}
+.review-code-panel figcaption {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-header);
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.review-code-language {
+  margin-right: auto;
+  font-family: var(--font-mono);
+}
+.review-code-panel figcaption button {
+  font-size: 11px;
+  min-height: 26px;
+  padding: 3px 8px;
+}
+.review-code-panel pre {
+  margin: 0;
+  padding: 12px;
+  max-width: 100%;
+  overflow: auto;
+  white-space: pre;
+  overflow-wrap: normal;
+  font: 12px/1.7 var(--font-mono);
+  tab-size: 2;
+}
+.review-code-panel code {
+  font: inherit;
+}
+
+@media (max-width: 600px) {
+  .durable-review-panel,
+  .durable-line-chat {
+    padding: 12px;
+  }
+  .durable-line-chat {
+    margin: 6px 0;
+  }
+  .review-message {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+  .review-avatar {
+    display: none;
+  }
+  .review-message-card {
+    padding: 10px;
+  }
+  .review-follow-up {
+    margin-left: 0;
+  }
+  .review-mode-buttons {
+    display: none;
+  }
+  .review-mode-select {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .review-composer-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .publication-preview {
+    padding: 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .review-streaming-dots i {
+    animation: none;
+    opacity: 1;
+  }
+}

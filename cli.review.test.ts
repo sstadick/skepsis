@@ -8,7 +8,7 @@
 
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -21,6 +21,7 @@ async function launch(
   cwd: string,
   state: string,
   classifierConfig?: string,
+  port = 0,
 ) {
   const child = spawn(
     process.execPath,
@@ -29,17 +30,27 @@ async function launch(
       '-f',
       'HEAD',
       ...(classifierConfig
-        ? ['--model', 'openai/gpt-5-mini', '--classifier-config', classifierConfig]
+        ? [
+            '--model',
+            'openai/gpt-5-mini',
+            ...(classifierConfig === 'default'
+              ? []
+              : ['--classifier-config', classifierConfig]),
+          ]
         : ['--no-agent']),
       '--no-open',
       '--host',
       '127.0.0.1',
+      '--port',
+      String(port),
     ],
     {
       cwd,
       env: {
         ...process.env,
         SKEPSIS_STATE_DIR: state,
+        XDG_CONFIG_HOME: join(state, 'config'),
+        SKEPSIS_CLASSIFIER_CONFIG: undefined,
         // No real credentials or inference: this smoke test only loads config,
         // inspects capabilities, and saves drafts in its isolated state directory.
         PI_CODING_AGENT_DIR: join(state, 'fixture-auth'),
@@ -91,7 +102,7 @@ async function launch(
   }
 }
 
-it.each(['source', 'packed', 'packed-classifier'] as const)(
+it.each(['source', 'packed', 'packed-classifier', 'packed-default-classifier'] as const)(
   'launches a %s local review, persists drafts and leaves source untouched',
   async (mode) => {
     if (mode !== 'source' && !existsSync(join(import.meta.dirname, 'dist/cli.js'))) return
@@ -127,8 +138,13 @@ it.each(['source', 'packed', 'packed-classifier'] as const)(
         entry = join(directory, 'package/dist/cli.js')
       }
       let classifierConfig: string | undefined
-      if (mode === 'packed-classifier') {
-        classifierConfig = join(directory, 'classifier.json')
+      if (mode === 'packed-classifier' || mode === 'packed-default-classifier') {
+        const configDirectory =
+          mode === 'packed-default-classifier'
+            ? join(state, 'config', 'skepsis')
+            : directory
+        await mkdir(configDirectory, { recursive: true })
+        classifierConfig = join(configDirectory, 'classifier.json')
         await writeFile(
           classifierConfig,
           JSON.stringify({
@@ -139,11 +155,13 @@ it.each(['source', 'packed', 'packed-classifier'] as const)(
           }),
         )
       }
-      server = await launch(entry, directory, state, classifierConfig)
+      const classifierOption =
+        mode === 'packed-default-classifier' ? 'default' : classifierConfig
+      server = await launch(entry, directory, state, classifierOption)
       const snapshot = (await fetch(`${server.url}/api/review`).then((r) =>
         r.json(),
       )) as ReviewSnapshot
-      expect(snapshot.agent.available).toBe(mode === 'packed-classifier')
+      expect(snapshot.agent.available).toBe(Boolean(classifierConfig))
       if (classifierConfig) {
         expect(snapshot.agent.codemode).toBe(true)
         expect(snapshot.agent.classifier).toEqual({
@@ -175,9 +193,17 @@ it.each(['source', 'packed', 'packed-classifier'] as const)(
       expect(saved.status, await saved.text()).toBe(200)
       expect(await readFile(join(directory, 'code.ts'), 'utf8')).toBe(contents)
       expect((await fetch(`${server.url}/`)).status).toBe(200)
+      const originalUrl = server.url
       await server.close()
       server = undefined
-      server = await launch(entry, directory, state, classifierConfig)
+      server = await launch(
+        entry,
+        directory,
+        state,
+        classifierOption,
+        Number(new URL(originalUrl).port),
+      )
+      expect(server.url).toBe(originalUrl)
       const reopened = (await fetch(`${server.url}/api/review`).then((r) =>
         r.json(),
       )) as ReviewSnapshot

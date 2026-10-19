@@ -48,6 +48,8 @@ const configSchema = z.strictObject({
     .max(16 * 1024 * 1024)
     .default(131072),
   timeoutMs: z.number().int().positive().max(60000).default(30000),
+  maxConcurrency: z.number().int().min(1).max(64).default(4),
+  maxQueuedRequests: z.number().int().min(0).max(256).default(64),
   cost: z
     .strictObject({
       input: z.number().nonnegative().finite(),
@@ -152,12 +154,48 @@ function validAnswers(result: ClassifierResult, context: ClassifierContext): boo
   })
 }
 
+// Reserve slots synchronously, including when handing one to the oldest waiter.
+// Cancelling a waiter removes it; cancelling an admitted request does NOT release it.
+function createRequestLimiter(maxConcurrency: number, maxQueuedRequests: number) {
+  let active = 0
+  const waiting: (() => void)[] = []
+  const release = () => {
+    active--
+    waiting.shift()?.()
+  }
+  return (signal: AbortSignal): Promise<() => void> => {
+    if (signal.aborted) return Promise.reject(new Error('Classifier request cancelled'))
+    if (active < maxConcurrency) {
+      active++
+      return Promise.resolve(release)
+    }
+    if (waiting.length >= maxQueuedRequests)
+      return Promise.reject(new Error('Classifier request queue full'))
+    return new Promise((resolve, reject) => {
+      const start = () => {
+        signal.removeEventListener('abort', cancel)
+        active++
+        resolve(release)
+      }
+      const cancel = () => {
+        const index = waiting.indexOf(start)
+        if (index !== -1) waiting.splice(index, 1)
+        signal.removeEventListener('abort', cancel)
+        reject(new Error('Classifier request cancelled'))
+      }
+      waiting.push(start)
+      signal.addEventListener('abort', cancel, { once: true })
+    })
+  }
+}
+
 /** Loads only a bounded JSON file; credentials stay inside the transport closure. */
 export async function loadReviewClassifier(
   path: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<{
   provider: Provider
+  concurrency: number
   summary: { provider: string; model: string; endpoint: string }
   instructions: string
   policyKey: string
@@ -253,7 +291,7 @@ export async function loadReviewClassifier(
     contextWindow: config.contextWindow,
     cost: { ...config.cost, cacheRead: 0, cacheWrite: 0 },
   }
-  let active = 0
+  const acquire = createRequestLimiter(config.maxConcurrency, config.maxQueuedRequests)
   const provider = createProvider({
     id: config.provider,
     auth: {
@@ -279,15 +317,16 @@ export async function loadReviewClassifier(
               : 'Review classifier request failed',
             timestamp: Date.now(),
           })
-          if (active >= 4) return failure()
-          active++
+          // Already-cancelled callers must not serialize inputs or consume queue space.
+          if (options?.signal?.aborted) return failure(true)
           const controller = new AbortController()
+          // One deadline for queue wait AND execution, never reset on admission.
           const timer = setTimeout(() => controller.abort(), config.timeoutMs)
           const signal = options?.signal
             ? AbortSignal.any([controller.signal, options.signal])
             : controller.signal
+          let release: (() => void) | undefined
           try {
-            if (signal.aborted) return failure(true)
             if (
               requested.id !== model.id ||
               requested.provider !== model.provider ||
@@ -297,12 +336,16 @@ export async function loadReviewClassifier(
               return failure()
             const serialized = serialize(context, config.maxRequestBytes)
             const input = contextSchema.parse(JSON.parse(serialized)) as ClassifierContext
+            // Validate and snapshot before queueing; later caller mutations cannot affect it.
+            release = await acquire(signal)
+            if (signal.aborted) return failure(Boolean(options?.signal?.aborted))
             // Never pass caller hooks, credentials, headers, fetch, or endpoint overrides.
             const result = await classify(model, input, {
               apiKey: 'review-classifier-transport-placeholder',
               signal,
               maxRetries: 0,
               fetch: async (_url, init) => {
+                signal.throwIfAborted()
                 if (
                   typeof init?.body !== 'string' ||
                   Buffer.byteLength(init.body) > config.maxRequestBytes
@@ -354,7 +397,9 @@ export async function loadReviewClassifier(
             return failure(Boolean(options?.signal?.aborted))
           } finally {
             clearTimeout(timer)
-            active--
+            // Await the native adapter/HTTP body through settlement, not an abort race.
+            // An abort signal alone is no evidence that transport work has stopped.
+            release?.()
           }
         },
       },
@@ -362,8 +407,9 @@ export async function loadReviewClassifier(
   })
   return {
     provider,
+    concurrency: config.maxConcurrency,
     summary: { provider: config.provider, model: config.model, endpoint: config.endpoint },
     policyKey: createHash('sha256').update(canonical(config)).digest('hex'),
-    instructions: `Use the configured classifier only for narrow structured classification, routing, ranking, scoring, or triage, not prose or general reasoning. Combine related questions over shared state. Always check stopReason before using answers; errors are not answers. A bool probability is P(true), not a boolean; a score is a continuous expected level (zero-based), not a selected category. Inspect probabilities and escalate ambiguous or consequential decisions. Text/JSON only, no images. Context window: ${config.contextWindow} tokens; maximum JSON request: ${config.maxRequestBytes} bytes. Summarize or split longer inputs conservatively.`,
+    instructions: `Use the configured classifier only for narrow structured classification, routing, ranking, scoring, or triage, not prose or general reasoning. Combine related questions over shared state. For independent items, use tools.classify_review({model, context: {state, questions}}) in one codemode script with Promise.allSettled (or a controlled pool), with up to ${config.maxConcurrency} classifier requests in parallel. The model argument is the configured classifier catalog entry. Prefer this tool for parallel scoring: built-in models.classify(model, context) has a separate four-call per-script cap and cannot use higher concurrency. The shared FIFO queue holds at most ${config.maxQueuedRequests} additional requests; overflow returns a sanitized error. Each request's ${config.timeoutMs} ms deadline covers queue wait plus execution, not a fresh timeout after admission; cancellation or timeout removes queued work. Always check each result's stopReason before using answers (including fulfilled promises); errors are not answers. A bool probability is P(true), not a boolean; a score is a continuous expected level (zero-based), not a selected category. Inspect probabilities and escalate ambiguous or consequential decisions. Text/JSON only, no images. Context window: ${config.contextWindow} tokens; maximum JSON request: ${config.maxRequestBytes} bytes. Summarize or split longer inputs conservatively.`,
   }
 }

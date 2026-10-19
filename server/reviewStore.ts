@@ -14,6 +14,7 @@ import { join } from 'node:path'
 import lockfile from 'proper-lockfile'
 import { createCodemodeExtension } from '@earendil-works/pi-durable/codemode'
 import { ReviewCodemodeSandbox } from './reviewCodemode.ts'
+import { formatReviewInput } from './reviewProposal.ts'
 import { PublicationRejected } from './github.ts'
 import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context'
 import type { JsonRepresentation } from '@earendil-works/chord'
@@ -38,9 +39,12 @@ import type {
   LineThread,
   ReviewAnchor,
   ReviewDraft,
+  ReviewIntent,
   ReviewPublication,
   SubmitReview,
 } from '../shared/review.ts'
+
+export class ReviewRequestConflict extends Error {}
 
 export interface ReviewStore {
   snapshot(): Promise<{
@@ -53,10 +57,11 @@ export interface ReviewStore {
     anchor: ReviewAnchor
     text: string
     context: string
+    intent?: ReviewIntent
   }): Promise<void>
   reply(
     threadId: string,
-    input: { id: string; text: string; context: string },
+    input: { id: string; text: string; context: string; intent?: ReviewIntent },
   ): Promise<void>
   confirmProvider(threadId: string, provider: string): Promise<void>
   abandonPublication(id: string): Promise<void>
@@ -144,14 +149,32 @@ export async function openReviewStore(opts: {
   let harness: Harness
   const sandbox = new ReviewCodemodeSandbox()
   const codemode = createCodemodeExtension({ sandbox })
-  const tools = [...opts.tools, ...(codemode.tools ?? [])]
+  let tools: readonly ToolRegistration[]
   try {
+    // Pi Durable 1.3 limits models.classify() globals to four in-flight calls.
+    // Reuse its exact tool implementation through the ordinary nested-tool path:
+    // replay, model resolution, cancellation, structured results and usage remain
+    // native, while our configured provider owns concurrency and queue bounds.
+    const classifier = codemode.tools?.find(
+      (tool) => tool.name === 'pi.codemode.models.classify',
+    )
+    if (!classifier) throw new Error('Pi Durable classifier bridge is unavailable')
+    const reviewTools: readonly ToolRegistration[] = [
+      ...opts.tools,
+      {
+        ...classifier,
+        name: 'classify_review',
+        description:
+          'Classify or score review data using the configured decision model. Same model/context arguments and result as models.classify(model, context), passed as {model, context}. Use this tool from codemode for parallel batches beyond the built-in models.classify four-call cap. The provider enforces its configured concurrency and bounded queue. Check each result.stopReason before answers.',
+      },
+    ]
+    tools = [...reviewTools, ...(codemode.tools ?? [])]
     const registry = createRegistry()
     registry.install(codemode)
     registry.install(
       defineExtension({
         name: 'skepsis-review',
-        tools: opts.tools,
+        tools: reviewTools,
         sections: [
           section('classifier', () => opts.classifierInstructions),
           section(
@@ -561,21 +584,39 @@ export async function openReviewStore(opts: {
     }
     const enqueue = async (
       threadId: string,
-      input: { id: string; text: string; context: string },
+      input: { id: string; text: string; context: string; intent?: ReviewIntent },
       anchor?: ReviewAnchor,
     ) => {
       await admit(async () => {
         await root.commit(async (tx) => {
           const state = await tx.doc(ReviewDoc, root.id)
+          const intent = input.intent ?? 'question'
           const existing = state.intents.find((item) => item.id === input.id)
           if (existing) {
-            if (existing.threadId !== threadId) throw new Error('Turn ID is already used')
+            const savedThread = state.threads.find((item) => item.id === existing.threadId)
+            const savedTurn = savedThread?.turns.find((item) => item.id === input.id)
+            // Context may be refreshed on retry; the request and its target may not.
+            // Missing intent on pre-intent records still means an ordinary question.
+            if (
+              existing.threadId !== threadId ||
+              !savedTurn ||
+              savedTurn.question !== input.text ||
+              (savedTurn.intent ?? 'question') !== intent ||
+              (anchor &&
+                (savedThread?.anchor.path !== anchor.path ||
+                  savedThread.anchor.side !== anchor.side ||
+                  savedThread.anchor.line !== anchor.line ||
+                  savedThread.anchor.revision !== anchor.revision))
+            )
+              throw new ReviewRequestConflict(
+                'Turn ID is already used for a different request',
+              )
             return
           }
           if (!opts.model) throw new Error('Configure a review model before asking Pi')
           let thread = state.threads.find((item) => item.id === threadId)
           if (anchor) {
-            if (thread) throw new Error('Thread ID is already used')
+            if (thread) throw new ReviewRequestConflict('Thread ID is already used')
             const created = await tx.createConversation({
               ownership: { kind: 'ownerless' },
             })
@@ -598,12 +639,12 @@ export async function openReviewStore(opts: {
             throw new Error('Review thread is missing or resolved')
           if (thread.providerChange)
             throw new Error('Confirm provider change before sending history')
-          thread.turns.push({ id: input.id, question: input.text })
+          thread.turns.push({ id: input.id, question: input.text, intent })
           thread.status = 'queued'
           state.intents.push({
             id: input.id,
             threadId,
-            content: `Review question:\n${input.text}\n\nUntrusted repository context:\n${input.context}`,
+            content: formatReviewInput({ ...input, intent, anchor: thread.anchor }),
             requestId: `review:${threadId}:${input.id}`,
             remainingMs: opts.maxRunMs ?? 300_000,
             status: 'queued',

@@ -27,11 +27,10 @@ reviews; regenerate it with `npm run build` when checking package behavior.
 
 ```
 cli.ts                CLI entry (commander). Detects jj/git, builds DiffArgs
-                      (incl. commentsEnabled: diff must end at @/working copy),
                       starts the API server, spawns Vite in --dev mode.
 server/
   main.ts             Hono server. GET /api/diff; POST/DELETE /api/viewed;
-                      POST/DELETE /api/comment; GET/POST /api/theme;
+                      GET /api/file-contents; GET/POST /api/theme;
                       GET /api/theme.js (pre-first-paint theme boot script
                       loaded by index.html); serves dist/web statics.
   settings.ts         Global (not per-repo) UI settings — currently just the
@@ -41,21 +40,28 @@ server/
   viewed.ts           Viewed state, content-addressed by git blob ID — files
                       auto-unview when content changes; no invalidation logic.
                       TSV per repo in ~/.local/share/skepsis/.
-  comment.ts          Inserts/removes <review>…</review> comment lines into
-                      real working-copy files (this is how review comments
-                      exist in the diff at all).
-  commentSyntax.ts    Comment syntax (prefix/suffix) by file extension.
+  repositoryFiles.ts  Shared bounded path validation and symlink-safe reads
+                      for agent context and browser file expansion.
+  reviewProposal.ts   Per-turn question/proposal protocol; suggestions remain
+                      private text, never edits or automatically saved drafts.
+  reviewPriorities.ts Explicit bounded classifier-only hunk-priority batches;
+                      original-patch anchors, ephemeral results, cancellation.
 shared/
   types.ts            API request/response types + zod schemas.
-  reviewComments.ts   <review> open/close tag constants and regexes shared by
-                      server insertion and client detection.
+  review.ts           Anchors, question/proposal intents, private threads,
+                      review drafts and publication request types.
 src/
-  App.tsx             Entire frontend (single file). Renders the diff with
+  App.tsx             Diff/navigation frontend. Renders the diff with
                       @pierre/diffs CodeView (virtualized, shadow-DOM items);
                       react-query for API state.
-  styles.css          All styling. OKLCH color tokens with a documented
-                      elevation ramp at the top — extend it, don't add ad hoc
-                      colors.
+  ReviewPanel.tsx     Private chats/proposals, editable draft comments and
+                      explicitly confirmed GitHub publication.
+  ReviewMarkdown.tsx Safe Markdown rendering: no raw HTML or remote images.
+  FileSidebar.tsx     Collapsible/filterable file tree and navigation.
+  HunkPriorities.tsx  Explicit scoring controls, ranked results and inline badges.
+  styles.css          Base styles and shared OKLCH color/elevation tokens.
+                      review.css, fileSidebar.css and priorities.css reuse them;
+                      extend the ramp, don't add ad hoc colors.
 ```
 
 The normal flow uses `shared/review.ts`, `server/reviewApi.ts`,
@@ -64,14 +70,36 @@ The normal flow uses `shared/review.ts`, `server/reviewApi.ts`,
 (model/auth), `server/github.ts` (PR checkout/publication), and
 `src/ReviewPanel.tsx`. `server/reviewCodemode.ts` adds the bounded QuickJS worker
 sandbox, and `server/reviewClassifier.ts` loads explicit System One endpoint
-configuration (`--classifier-config` / `SKEPSIS_CLASSIFIER_CONFIG`). Classifier
+configuration (`--classifier-config`, `SKEPSIS_CLASSIFIER_CONFIG`, then the user's
+`~/.config/skepsis/classifier.json`; absolute XDG_CONFIG_HOME overrides `.config`).
+The default is a data-only user opt-in, never repository config or executable Pi
+extensions. Invalid selected config fails closed; `--no-agent` skips it. Classifier
 credentials remain in server-side closures; never put them in model catalog
 metadata. Use a localhost HTTP stub for classifier tests, never the user's real
 endpoint. The build ships `codemodeWorker.js` and `quickjs.wasm` alongside the CLI;
 exercise both outside `node_modules` when changing packaging.
 
-The original source-backed comment and external queue
-modules remain legacy only. Never use a real GitHub publication as a test.
+The source-backed comment system and external queue are deleted. Only HTTP 410
+and CLI migration errors remain for old callers; never reintroduce source-tag
+parsing, source-writing routes, discovery records, or poll/answer/fail clients.
+Proposal requests use the private thread APIs with intent `propose-change`. They
+must not edit files, save drafts automatically, or publish. Human copy/save/preview
+and submission remain separate steps.
+
+Classifier `maxConcurrency` (1–64, default 4) and `maxQueuedRequests` (0–256,
+default 64) govern independent codemode calls. The FIFO queue is bounded and
+abortable; request timeouts cover waiting plus execution. `tools.classify_review`
+reuses Pi Durable's native classifier tool through ordinary nested calls, avoiding
+its models.classify global's fixed four-call cap. Keep its native replay, usage,
+model resolution and cancellation behavior; verify this alias on dependency updates.
+Only release active
+capacity when transport settles, not merely when its abort signal fires.
+Conversational runs remain single-admission per review store. Hunk priorities use
+one separate, explicit classifier-only batch through the same provider limiter.
+They never send conversation history or fall back to chat, and are ephemeral rather
+than durable: no inference on GET, browser reload, or server restart. Always bind
+results to the original served-patch revision, never expanded browser hunks.
+Never use a real GitHub publication as a test.
 Use the faux provider and temp repositories for agent tests; never spend model
 tokens or mutate user repositories just to test chat. Publication is an explicit
 human action; private conversation is never included in its payload.

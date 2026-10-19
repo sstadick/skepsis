@@ -24,7 +24,9 @@ import {
   type ReviewAnchor,
 } from '../shared/review.ts'
 import type { DiffArgs } from '../shared/types.ts'
-import { openReviewStore, type ReviewStore } from './reviewStore.ts'
+import { priorityRequestSchema } from '../shared/priorities.ts'
+import { createReviewPriorities, PriorityRequestError } from './reviewPriorities.ts'
+import { openReviewStore, ReviewRequestConflict, type ReviewStore } from './reviewStore.ts'
 import { createReviewContext, ReviewValidationError } from './reviewContext.ts'
 import {
   preflightReview,
@@ -40,6 +42,7 @@ export interface ReviewOptions {
   model?: { provider: string; modelId: string }
   agent: ReviewSnapshot['agent']
   classifierInstructions?: string
+  classifierConcurrency?: number
   toolPolicyKey?: string
   browserOrigin?: string
 }
@@ -61,16 +64,31 @@ export async function mountReviewApi(
   // Progress snapshots must not spawn git/jj. Refresh on diff reloads and anchor
   // actions, including rejected stale actions so the browser can recover.
   let revision = (await context.current()).revision
-  const refreshRevision = async (patch?: string) => {
-    const next = (
-      await (patch === undefined ? context.current() : context.revisionForPatch(patch))
-    ).revision
+  const updateRevision = (next: string) => {
     if (next !== revision) {
       revision = next
+      priorities.invalidate(next)
       opts.publish()
     }
     return next
   }
+  const priorities = createReviewPriorities({
+    revision,
+    models: opts.review.models,
+    classifier: opts.review.agent.classifier,
+    classifierConcurrency: opts.review.classifierConcurrency,
+    current: async (signal) => {
+      const state = await context.current(signal)
+      updateRevision(state.revision)
+      return state
+    },
+    publish: opts.publish,
+  })
+  const refreshRevision = async (patch?: string) =>
+    updateRevision(
+      (await (patch === undefined ? context.current() : context.revisionForPatch(patch)))
+        .revision,
+    )
   const anchorContext = async (anchor: ReviewAnchor, requireHunk = false) => {
     try {
       return await context.anchorContext(anchor, requireHunk)
@@ -97,11 +115,13 @@ export async function mountReviewApi(
     )
       return c.json({ error: 'Forbidden origin or host' }, 403)
     const path = c.req.path
-    if (['/api/diff', '/api/review', '/api/session'].includes(path))
+    if (['/api/diff', '/api/review', '/api/session', '/api/priorities'].includes(path))
       c.header('Cache-Control', 'no-store')
     const mutation =
       !['GET', 'HEAD', 'OPTIONS'].includes(c.req.method) &&
-      (path === '/api/threads' ||
+      (path === '/api/priorities' ||
+        path.startsWith('/api/priorities/') ||
+        path === '/api/threads' ||
         path.startsWith('/api/threads/') ||
         path === '/api/drafts' ||
         path.startsWith('/api/drafts/') ||
@@ -138,10 +158,18 @@ export async function mountReviewApi(
   app.use('/api/threads', bodyLimit({ maxSize: 65536 }))
   app.use('/api/drafts', bodyLimit({ maxSize: 65536 }))
   app.use('/api/review/*', bodyLimit({ maxSize: 65536 }))
+  app.use('/api/priorities', bodyLimit({ maxSize: 65536 }))
+  app.use('/api/priorities/*', bodyLimit({ maxSize: 65536 }))
   // Route-local boundary: legacy endpoints retain their own error handling.
   app.use('/api/*', async (c, next) => {
     await next()
-    if (c.error instanceof ReviewValidationError || c.error instanceof PublicationRejected)
+    if (c.error instanceof PriorityRequestError)
+      c.res = c.json({ error: c.error.message }, c.error.status)
+    if (
+      c.error instanceof ReviewValidationError ||
+      c.error instanceof PublicationRejected ||
+      c.error instanceof ReviewRequestConflict
+    )
       c.res = c.json({ error: c.error.message }, 409)
   })
   app.get('/api/session', (c) => {
@@ -156,6 +184,18 @@ export async function mountReviewApi(
       agent: opts.review.agent,
     } satisfies ReviewSnapshot),
   )
+  app.get('/api/priorities', (c) => c.json(priorities.snapshot()))
+  app.post('/api/priorities', async (c) => {
+    const parsed = priorityRequestSchema.safeParse(await c.req.json().catch(() => null))
+    if (!parsed.success) return c.json({ error: 'Invalid priority request' }, 400)
+    const result = await priorities.start(parsed.data)
+    return c.json(result, result.status === 'running' ? 202 : 200)
+  })
+  app.post('/api/priorities/cancel', async (c) => {
+    const parsed = priorityRequestSchema.safeParse(await c.req.json().catch(() => null))
+    if (!parsed.success) return c.json({ error: 'Invalid priority cancellation' }, 400)
+    return c.json(priorities.cancel(parsed.data))
+  })
   app.post('/api/threads', async (c) => {
     const parsed = createThreadSchema.safeParse(await c.req.json().catch(() => null))
     if (!parsed.success) return c.json({ error: 'Invalid thread' }, 400)
@@ -309,5 +349,11 @@ export async function mountReviewApi(
     await store.abandonPublication(parsed.data.id)
     return c.json({ ok: true })
   })
+  const closeStore = store.close.bind(store)
+  let closing: Promise<void> | undefined
+  // Begin both shutdowns immediately: a slow classifier transport must not
+  // keep the conversational agent running while we wait for it to settle.
+  store.close = () =>
+    (closing ??= Promise.all([priorities.close(), closeStore()]).then(() => {}))
   return store
 }

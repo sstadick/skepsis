@@ -57,7 +57,6 @@ async function fixture() {
     args: ['HEAD'],
     files: [],
     endpoints: { left: 'HEAD', right: 'workingCopy' },
-    commentsEnabled: true,
   }
   return { cwd, git, source, context: createReviewContext(cwd, source) }
 }
@@ -222,7 +221,6 @@ it.skipIf(!hasJj)(
       vcs: 'jj',
       args: ['-f', '@-'],
       files: ['new.txt'],
-      commentsEnabled: true,
       endpoints: { left: '@-', right: 'workingCopy' },
     })
     const { revision, patch } = await context.current()

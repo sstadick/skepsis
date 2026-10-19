@@ -9,17 +9,23 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createHash } from 'node:crypto'
-import { constants } from 'node:fs'
-import { lstat, open, realpath } from 'node:fs/promises'
-import { isAbsolute, resolve } from 'node:path'
+import { lstat, realpath } from 'node:fs/promises'
+import { resolve } from 'node:path'
 import { parsePatchFiles } from '@pierre/diffs'
 import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-durable'
 import type { PullRequest, ReviewAnchor } from '../shared/review.ts'
 import type { DiffArgs } from '../shared/types.ts'
 import { diffCommand } from './diff.ts'
+import {
+  MAX_FILE_BYTES,
+  ReviewValidationError,
+  validateReviewPath,
+  workingFile,
+} from './repositoryFiles.ts'
 
-const MAX_FILE_BYTES = 1024 * 1024
+export { ReviewValidationError, validateReviewPath } from './repositoryFiles.ts'
+
 const deadline = (signal?: AbortSignal) =>
   AbortSignal.any([AbortSignal.timeout(15000), ...(signal ? [signal] : [])])
 const output = (text: string) => ({
@@ -31,115 +37,43 @@ const output = (text: string) => ({
   ],
 })
 
-export class ReviewValidationError extends Error {}
 const invalid = (message: string): never => {
   throw new ReviewValidationError(message)
 }
-export function validateReviewPath(path: string): void {
-  if (
-    !path ||
-    path.length > 4096 ||
-    isAbsolute(path) ||
-    path.includes('\\') ||
-    [...path].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) ||
-    path
-      .split('/')
-      .some((part) => !part || part === '.' || part === '..' || part === '.git') ||
-    path.startsWith('-')
-  )
-    invalid('Invalid repository path')
-}
 
-async function workingFile(
-  cwd: string,
-  path: string,
-  signal?: AbortSignal,
-): Promise<string | null> {
-  signal?.throwIfAborted()
-  validateReviewPath(path)
-  const root = await realpath(cwd)
-  const handles: { file: Awaited<ReturnType<typeof open>>; path: string }[] = []
-  try {
-    // Pin every directory on Linux: O_NOFOLLOW on just the leaf is insufficient.
-    // Never canonicalize a user path and then open its symlink target.
-    let target = root
-    for (const part of ['', ...path.split('/')]) {
-      signal?.throwIfAborted()
-      const parent = handles.at(-1)
-      if (part) target = resolve(target, part)
-      const candidate =
-        parent && process.platform === 'linux'
-          ? `/proc/self/fd/${parent.file.fd}/${part}`
-          : target
-      // oxlint-disable-next-line no-await-in-loop
-      const before = await lstat(candidate)
-      if (before.isSymbolicLink()) invalid('Repository symlink escapes safe file access')
-      const directory = target !== resolve(root, path)
-      if (directory && !before.isDirectory()) invalid('Path is not a directory')
-      // oxlint-disable-next-line no-await-in-loop
-      const file = await open(
-        candidate,
-        constants.O_RDONLY |
-          constants.O_NOFOLLOW |
-          constants.O_NONBLOCK |
-          (directory ? constants.O_DIRECTORY : 0),
-      )
-      handles.push({ file, path: target })
-      // oxlint-disable-next-line no-await-in-loop
-      const after = await file.stat()
-      if (before.dev !== after.dev || before.ino !== after.ino)
-        invalid('Repository path changed during read')
-    }
-    const revalidate = async () => {
-      for (const entry of handles) {
-        // Check every original component, not just containment: an internal
-        // symlink to an ignored secret is just as unsafe as an external one.
-        // oxlint-disable-next-line no-await-in-loop
-        const current = await lstat(entry.path)
-        // oxlint-disable-next-line no-await-in-loop
-        const opened = await entry.file.stat()
-        if (
-          current.isSymbolicLink() ||
-          current.dev !== opened.dev ||
-          current.ino !== opened.ino
-        )
-          invalid('Repository path changed during read')
-        if (
-          process.platform === 'linux' &&
-          // oxlint-disable-next-line no-await-in-loop
-          (await realpath(`/proc/self/fd/${entry.file.fd}`)) !== entry.path
-        )
-          invalid('Repository path changed during read')
+/**
+ * Persisted v1 anchors hashed the CLI's JSON.stringify(DiffArgs), including its
+ * property order and the now-removed commentsEnabled bit (cli.ts at e83ec8e).
+ * Retain that wire representation ONLY for fingerprint compatibility, not as a
+ * capability. Project known CLI fields explicitly so caller key order and future
+ * unrelated fields cannot invalidate existing private threads and drafts.
+ */
+function v1SourceFingerprint(source: DiffArgs, pr?: PullRequest) {
+  const { vcs, args, files, displayArgs } = source
+  const endpoints: DiffArgs['endpoints'] = source.endpoints
+    ? {
+        left: source.endpoints.left,
+        right:
+          source.endpoints.right === 'workingCopy'
+            ? 'workingCopy'
+            : { rev: source.endpoints.right.rev },
       }
-    }
-    await revalidate()
-    const file = handles.at(-1)!.file
-    const stat = await file.stat()
-    if (!stat.isFile() || stat.size > 1024 * 1024)
-      invalid('File is not a bounded regular text file')
-    // A fixed-size read also bounds files that grow after stat().
-    const buffer = Buffer.alloc(MAX_FILE_BYTES + 1)
-    let size = 0
-    while (size < buffer.length) {
-      signal?.throwIfAborted()
-      // Sequential reads enforce the byte budget even if the file grows.
-      // oxlint-disable-next-line no-await-in-loop
-      const { bytesRead } = await file.read(buffer, size, buffer.length - size, size)
-      if (!bytesRead) break
-      size += bytesRead
-    }
-    if (size > MAX_FILE_BYTES) invalid('File is too large')
-    await revalidate()
-    return buffer.subarray(0, size).toString('utf8')
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code === 'ENOENT') return null
-    if (code === 'ELOOP' || code === 'ENOTDIR')
-      invalid('Repository symlink escapes safe file access')
-    throw error
-  } finally {
-    await Promise.all(handles.map(({ file }) => file.close()))
-  }
+    : null
+  // runServe's PR literal put files before the legacy bit, unlike local diffs.
+  if (pr) return { vcs, args, files, commentsEnabled: false, endpoints }
+
+  const rev = vcs === 'jj' && args[0] === '-r' ? args[1] : undefined
+  const commentsEnabled =
+    vcs === 'git'
+      ? endpoints?.right === 'workingCopy'
+      : rev !== undefined
+        ? rev === '@' || rev.endsWith('..@')
+        : endpoints?.right !== 'workingCopy' && endpoints?.right.rev === '@'
+  // jj -r used the literal suffix even for exotic revsets with null endpoints;
+  // --from/--to used the right revision. Only local Git emitted displayArgs.
+  return vcs === 'git'
+    ? { vcs, args, commentsEnabled, files, endpoints, displayArgs }
+    : { vcs, args, commentsEnabled, files, endpoints }
 }
 
 export function createReviewContext(cwd: string, source: DiffArgs, pr?: PullRequest) {
@@ -279,7 +213,7 @@ export function createReviewContext(cwd: string, source: DiffArgs, pr?: PullRequ
     const revision = createHash('sha256')
       .update(
         JSON.stringify([
-          source,
+          v1SourceFingerprint(source, pr),
           resolved,
           pr?.baseSha,
           pr?.headSha,

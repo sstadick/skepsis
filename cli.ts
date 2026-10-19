@@ -11,22 +11,12 @@ import { spawn, execFileSync } from 'child_process'
 import { existsSync } from 'node:fs'
 import { realpath } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { Command } from '@commander-js/extra-typings'
-import { readServerInfo } from './server/discovery.ts'
+import { Command, InvalidArgumentError } from '@commander-js/extra-typings'
 import { startServer } from './server/main.ts'
 import { parsePullRequestUrl, preparePullRequest } from './server/github.ts'
 import { reviewDirectory, stateDirectory } from './server/statePaths.ts'
 import type { PullRequest } from './shared/review.ts'
-import { AGENT_BACKENDS } from './shared/types.ts'
-import type {
-  AgentBackend,
-  DiffArgs,
-  DiffEndpoints,
-  ErrorResponse,
-  OkResponse,
-  QuestionClaim,
-  QuestionClaimResponse,
-} from './shared/types.ts'
+import type { DiffArgs, DiffEndpoints } from './shared/types.ts'
 
 interface ServeOptions {
   revisions?: string
@@ -35,16 +25,11 @@ interface ServeOptions {
   git?: boolean
   dev?: boolean
   host: string
+  port?: number
   model?: string
   classifierConfig?: string
   agent?: boolean
   open?: boolean
-}
-
-interface QueueOptions {
-  cwd?: string
-  server?: string
-  token?: string
 }
 
 function detectVcs(): 'jj' | 'git' {
@@ -114,18 +99,15 @@ function parseRange(rev: string): { left: string; right: string } | null {
 function buildDiffSource(opts: ServeOptions, files: string[], vcs: 'jj' | 'git'): DiffArgs {
   if (vcs === 'jj') {
     const args: string[] = []
-    let commentsEnabled: boolean
     let endpoints: DiffEndpoints
     if (opts.from || opts.to || !opts.revisions) {
       const from = opts.from ?? (opts.to ? undefined : 'fork_point(trunk() | @)')
       if (from) args.push('--from', from)
       if (opts.to) args.push('--to', opts.to)
-      commentsEnabled = !opts.to || opts.to === '@'
       endpoints = { left: from ?? '@', right: { rev: opts.to ?? '@' } }
     } else {
       const rev = opts.revisions
       args.push('-r', rev)
-      commentsEnabled = rev === '@' || rev.endsWith('..@')
       const range = parseRange(rev)
       if (range) {
         endpoints = { left: range.left, right: { rev: range.right } }
@@ -135,32 +117,27 @@ function buildDiffSource(opts: ServeOptions, files: string[], vcs: 'jj' | 'git')
         endpoints = null
       }
     }
-    return { vcs: 'jj', args, commentsEnabled, files, endpoints }
+    return { vcs: 'jj', args, files, endpoints }
   }
 
   let args: string[]
-  let commentsEnabled: boolean
   let endpoints: DiffEndpoints
   let displayArgs: string[] | undefined
   if (opts.from || opts.to) {
     if (opts.to) {
       args = [opts.from ?? 'HEAD', opts.to]
-      commentsEnabled = false
       endpoints = { left: opts.from ?? 'HEAD', right: { rev: opts.to } }
     } else {
       args = [opts.from!]
-      commentsEnabled = true
       endpoints = { left: opts.from!, right: 'workingCopy' }
     }
   } else if (!opts.revisions) {
     const { base, mergeBase } = resolveGitBase()
     args = [mergeBase]
     displayArgs = ['--merge-base', base]
-    commentsEnabled = true
     endpoints = { left: mergeBase, right: 'workingCopy' }
   } else {
     const rev = opts.revisions
-    commentsEnabled = !rev.includes('..')
     args = [rev]
     const range = parseRange(rev)
     if (range) {
@@ -171,7 +148,7 @@ function buildDiffSource(opts: ServeOptions, files: string[], vcs: 'jj' | 'git')
       endpoints = null
     }
   }
-  return { vcs: 'git', args, commentsEnabled, files, endpoints, displayArgs }
+  return { vcs: 'git', args, files, endpoints, displayArgs }
 }
 
 function findCheckoutRoot(): string | null {
@@ -227,7 +204,6 @@ async function runServe(files: string[], opts: ServeOptions): Promise<void> {
       vcs: 'git',
       args: [pullRequest.diffBaseSha, pullRequest.headSha],
       files: [],
-      commentsEnabled: false,
       endpoints: { left: pullRequest.diffBaseSha, right: { rev: pullRequest.headSha } },
     }
   } else {
@@ -247,6 +223,7 @@ async function runServe(files: string[], opts: ServeOptions): Promise<void> {
     diffSource,
     cwd,
     hostname,
+    port: opts.port,
     review: {
       directory: reviewDirectory(identity),
       pullRequest,
@@ -254,6 +231,7 @@ async function runServe(files: string[], opts: ServeOptions): Promise<void> {
       model: agent.model,
       agent: agent.status,
       classifierInstructions: agent.classifierInstructions,
+      classifierConcurrency: agent.classifierConcurrency,
       toolPolicyKey: agent.toolPolicyKey,
       browserOrigin: opts.dev ? `http://${hostname}:5173` : undefined,
     },
@@ -305,175 +283,6 @@ async function runServe(files: string[], opts: ServeOptions): Promise<void> {
   }
 }
 
-async function readStdin(): Promise<string> {
-  const chunks: Uint8Array[] = []
-  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk))
-  return Buffer.concat(chunks).toString('utf-8')
-}
-
-async function resolveServerAccess(
-  opts: QueueOptions,
-): Promise<{ url: string; token: string }> {
-  const url = opts.server ?? process.env['SKEPSIS_SERVER_URL']
-  const token = opts.token ?? process.env['SKEPSIS_SERVER_TOKEN']
-  if (url && token) return { url, token }
-
-  const cwd = opts.cwd ?? process.cwd()
-  try {
-    const discovered = await readServerInfo(cwd)
-    return { url: url ?? discovered.url, token: token ?? discovered.token }
-  } catch (error) {
-    if (url && token) return { url, token }
-    throw new Error(
-      `No running Skepsis server discovered for ${cwd}. Start Skepsis there first or pass --server/--token.`,
-      { cause: error },
-    )
-  }
-}
-
-async function apiFetch<T>(
-  endpoint: string,
-  init: { method: string; body?: unknown; access: { url: string; token: string } },
-): Promise<T> {
-  const res = await fetch(new URL(endpoint, init.access.url), {
-    method: init.method,
-    headers: {
-      authorization: `Bearer ${init.access.token}`,
-      'content-type': 'application/json',
-    },
-    body: init.body === undefined ? undefined : JSON.stringify(init.body),
-  })
-  if (!res.ok) {
-    const error = (await res.json().catch(() => null)) as ErrorResponse | null
-    throw new Error(error?.error ?? `Request failed (${res.status})`)
-  }
-  return res.json() as Promise<T>
-}
-
-function parseBackend(raw: string | undefined): AgentBackend | undefined {
-  if (raw == null) return undefined
-  if ((AGENT_BACKENDS as readonly string[]).includes(raw)) return raw as AgentBackend
-  throw new Error(`Unknown backend: ${raw}`)
-}
-
-/** Undefined is one-shot, null waits indefinitely, and a number is a timeout. */
-function parsePollWait(raw: string | boolean | undefined): number | null | undefined {
-  if (raw === undefined || raw === false) return undefined
-  if (raw === true) return null
-
-  const seconds = Number(raw)
-  const milliseconds = seconds * 1000
-  if (!Number.isFinite(seconds) || seconds <= 0 || !Number.isFinite(milliseconds)) {
-    throw new Error('--wait must be a positive number of seconds')
-  }
-  return milliseconds
-}
-
-interface QueueEventStream {
-  nextQueued: () => Promise<void>
-  close: () => void
-}
-
-/**
- * Subscribe before the initial claim so a question queued during that request
- * cannot be missed. Subsequent claims happen only after a matching queue
- * event, avoiding the old one-request-per-second idle loop.
- */
-async function openQueueEventStream(
-  access: { url: string; token: string },
-  backend: AgentBackend | undefined,
-  signal: AbortSignal,
-): Promise<QueueEventStream> {
-  const res = await fetch(new URL('/api/events', access.url), {
-    headers: { authorization: `Bearer ${access.token}` },
-    signal,
-  })
-  if (!res.ok) throw new Error(`Event stream failed (${res.status})`)
-  if (!res.body) throw new Error('Event stream returned no response body')
-
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  return {
-    nextQueued: async () => {
-      // Event frames and chunks have independent boundaries, so retain the
-      // unfinished tail between reads and consume complete frames in order.
-      // oxlint-disable no-await-in-loop
-      while (true) {
-        const boundary = buffer.indexOf('\n\n')
-        if (boundary >= 0) {
-          const block = buffer.slice(0, boundary)
-          buffer = buffer.slice(boundary + 2)
-          const event = block
-            .split('\n')
-            .find((line) => line.startsWith('event: '))
-            ?.slice('event: '.length)
-          if (event !== 'review-changed') continue
-          const data = block
-            .split('\n')
-            .filter((line) => line.startsWith('data: '))
-            .map((line) => line.slice('data: '.length))
-            .join('\n')
-          const change = JSON.parse(data) as {
-            reason?: string
-            backend?: AgentBackend
-          }
-          if (
-            change.reason === 'queued' &&
-            (backend === undefined || change.backend === backend)
-          ) {
-            return
-          }
-          continue
-        }
-
-        const { done, value } = await reader.read()
-        if (done) throw new Error('Skepsis event stream closed')
-        buffer += decoder.decode(value, { stream: true }).replaceAll('\r\n', '\n')
-      }
-      // oxlint-enable no-await-in-loop
-    },
-    close: () => {
-      void reader.cancel().catch(() => {})
-    },
-  }
-}
-
-function printQuestion(question: QuestionClaim, asJson: boolean): void {
-  if (asJson) {
-    process.stdout.write(JSON.stringify(question) + '\n')
-    return
-  }
-  const conversation =
-    question.messages.length > 1
-      ? [
-          'conversation:',
-          ...question.messages.flatMap((message) => {
-            const label =
-              message.role === 'user' ? 'user' : `assistant (${message.outcome})`
-            const [first = '', ...rest] = message.content.split('\n')
-            return [`  ${label}: ${first}`, ...rest.map((line) => `    ${line}`)]
-          }),
-          '',
-        ]
-      : []
-  process.stdout.write(
-    [
-      `id: ${question.id}`,
-      `backend: ${question.backend}`,
-      `file: ${question.file}`,
-      `line: ${question.line}`,
-      `lease: ${question.leaseId}`,
-      `question: ${question.question}`,
-      '',
-      ...conversation,
-      question.excerpt,
-      '',
-    ].join('\n'),
-  )
-}
-
 const program = new Command()
   .name('skepsis')
   .description('Local PR review UI with private, durable agent conversations')
@@ -486,13 +295,18 @@ program
   .option('--git', 'force git mode (skip jj detection)')
   .option('--dev', 'run with Vite dev server for development')
   .option('--host <address>', 'loopback address to bind the HTTP server to', 'localhost')
+  .option('--port <port>', 'HTTP port (default: auto; 0 selects a free port)', (value) => {
+    if (!/^\d+$/.test(value) || Number(value) > 65535)
+      throw new InvalidArgumentError('Port must be an integer from 0 to 65535')
+    return Number(value)
+  })
   .option(
     '--model <provider/model>',
     'review model (defaults to SKEPSIS_MODEL or Pi settings)',
   )
   .option(
     '--classifier-config <path>',
-    'System One classifier JSON config (or SKEPSIS_CLASSIFIER_CONFIG)',
+    'classifier JSON (env: SKEPSIS_CLASSIFIER_CONFIG; default: ~/.config/skepsis/classifier.json)',
   )
   .option('--no-agent', 'disable model calls; keep private history and review drafts')
   .option('--no-open', 'print the server URL without opening a browser')
@@ -500,154 +314,13 @@ program
     await runServe(files, opts)
   })
 
-program
-  .command('poll')
-  .description('Claim one queued review question for an agent backend')
-  .option('--backend <backend>', 'limit to a specific backend (pi, claude, codex)')
-  .option('--worker <name>', 'worker name recorded on the claim', `${process.pid}`)
-  .option('--json', 'print the claimed question as JSON')
-  .option(
-    '--wait [seconds]',
-    'wait for a question; optional seconds stop starting new claims',
+// Do not reinterpret removed worker commands as path filters and start a server.
+// Prefix a literal file of the same name with "./" to review it.
+const removedCommand = process.argv[2]
+if (removedCommand && ['poll', 'answer', 'fail'].includes(removedCommand)) {
+  program.error(
+    `The "${removedCommand}" command has been removed. Use private chats in the review UI. To review a path named "${removedCommand}", pass "./${removedCommand}".`,
   )
-  .option('--cwd <path>', 'repository cwd used for server discovery')
-  .option('--server <url>', 'explicit Skepsis server URL')
-  .option('--token <token>', 'explicit Skepsis server token')
-  .action(
-    async (opts: {
-      backend?: string
-      worker: string
-      json?: boolean
-      wait?: string | boolean
-      cwd?: string
-      server?: string
-      token?: string
-    }) => {
-      const wait = parsePollWait(opts.wait)
-      const backend = parseBackend(opts.backend)
-      const access = await resolveServerAccess(opts)
-
-      const claim = () =>
-        apiFetch<QuestionClaimResponse>('/api/questions/claim', {
-          method: 'POST',
-          access,
-          body: { backend, worker: opts.worker },
-        })
-
-      if (wait === undefined) {
-        const res = await claim()
-        if (res.question) printQuestion(res.question, opts.json ?? false)
-        return
-      }
-
-      const controller = new AbortController()
-      const deadline = typeof wait === 'number' ? performance.now() + wait : undefined
-      const expired = () => deadline !== undefined && performance.now() >= deadline
-      let timedOut = false
-      const timer =
-        typeof wait === 'number'
-          ? setTimeout(() => {
-              timedOut = true
-              controller.abort()
-            }, wait)
-          : undefined
-      let events: QueueEventStream | undefined
-      try {
-        events = await openQueueEventStream(access, backend, controller.signal)
-        if (expired()) return
-        // One immediate attempt catches work queued before the subscription.
-        let res = await claim()
-        if (res.question) {
-          printQuestion(res.question, opts.json ?? false)
-          return
-        }
-
-        while (true) {
-          if (expired()) return
-          // The single blocking stream read is the idle path. Claims remain
-          // sequential so this invocation can never lease more than one job.
-          // oxlint-disable-next-line no-await-in-loop
-          await events.nextQueued()
-          if (expired()) return
-          // oxlint-disable-next-line no-await-in-loop
-          res = await claim()
-          if (res.question) {
-            printQuestion(res.question, opts.json ?? false)
-            return
-          }
-        }
-      } catch (error) {
-        const expectedTimeout =
-          timedOut && error instanceof Error && error.name === 'AbortError'
-        if (!expectedTimeout) throw error
-      } finally {
-        clearTimeout(timer)
-        controller.abort()
-        events?.close()
-      }
-    },
-  )
-
-program
-  .command('answer')
-  .description('Answer a claimed review question')
-  .argument('<id>', 'question id')
-  .requiredOption('--lease <leaseId>', 'lease returned from skepsis poll')
-  .option('--text <answer>', 'answer text')
-  .option('--stdin', 'read answer text from stdin')
-  .option('--cwd <path>', 'repository cwd used for server discovery')
-  .option('--server <url>', 'explicit Skepsis server URL')
-  .option('--token <token>', 'explicit Skepsis server token')
-  .action(
-    async (
-      id: string,
-      opts: {
-        lease: string
-        text?: string
-        stdin?: boolean
-        cwd?: string
-        server?: string
-        token?: string
-      },
-    ) => {
-      const answer = opts.stdin ? await readStdin() : opts.text
-      if (!answer?.trim()) throw new Error('Provide answer text with --text or --stdin')
-      const access = await resolveServerAccess(opts)
-      await apiFetch<OkResponse>(`/api/questions/${id}/answer`, {
-        method: 'POST',
-        access,
-        body: { leaseId: opts.lease, answer },
-      })
-    },
-  )
-
-program
-  .command('fail')
-  .description('Mark a claimed review question as failed')
-  .argument('<id>', 'question id')
-  .requiredOption('--lease <leaseId>', 'lease returned from skepsis poll')
-  .requiredOption('--message <text>', 'failure message')
-  .option('--cwd <path>', 'repository cwd used for server discovery')
-  .option('--server <url>', 'explicit Skepsis server URL')
-  .option('--token <token>', 'explicit Skepsis server token')
-  .action(
-    async (
-      id: string,
-      opts: {
-        lease: string
-        message: string
-        cwd?: string
-        server?: string
-        token?: string
-      },
-    ) => {
-      const access = await resolveServerAccess(opts)
-      await apiFetch<OkResponse>(`/api/questions/${id}/fail`, {
-        method: 'POST',
-        access,
-        body: { leaseId: opts.lease, error: opts.message },
-      })
-    },
-  )
+}
 
 await program.parseAsync()

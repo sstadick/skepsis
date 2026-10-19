@@ -6,7 +6,7 @@
  * Copyright Oxide Computer Company
  */
 
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -115,7 +115,91 @@ describe('review agent selection', () => {
   })
 })
 
+async function userConfig(model = 'user-default', configHome = join(directory, '.config')) {
+  const folder = join(configHome, 'skepsis')
+  await mkdir(folder, { recursive: true })
+  const file = join(folder, 'classifier.json')
+  await writeFile(
+    file,
+    JSON.stringify({
+      model,
+      endpoint: `https://example.test/${model}/systemone`,
+      maxConcurrency: 8,
+    }),
+  )
+  return file
+}
+
 describe('configured decision models', () => {
+  it('loads the persistent user default without network calls or importing Pi extensions', async () => {
+    await userConfig()
+    await writeFile(
+      join(directory, 'settings.json'),
+      JSON.stringify({ extensions: ['!do-not-execute'] }),
+    )
+    const fetch = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('No inference during setup'))
+    try {
+      const result = await setup(undefined, { OPENAI_API_KEY: 'fixture-key' })
+      expect(result.status.classifier).toEqual({
+        provider: 'review-classifier',
+        model: 'user-default',
+        endpoint: 'https://example.test/user-default/systemone',
+      })
+      expect(result.classifierConcurrency).toBe(8)
+      expect(await result.models.getAvailableOfType('classifier')).toHaveLength(1)
+      expect(fetch).not.toHaveBeenCalled()
+    } finally {
+      fetch.mockRestore()
+    }
+  })
+
+  it('honors absolute XDG_CONFIG_HOME and ignores relative XDG paths', async () => {
+    await userConfig()
+    const xdg = join(directory, 'xdg')
+    await userConfig('xdg-default', xdg)
+    expect(
+      (await setup(undefined, { XDG_CONFIG_HOME: xdg })).status.classifier?.model,
+    ).toBe('xdg-default')
+    expect(
+      (await setup(undefined, { XDG_CONFIG_HOME: 'relative-project-config' })).status
+        .classifier?.model,
+    ).toBe('user-default')
+  })
+
+  it('prioritizes explicit paths then environment over the user default, never falls back on errors', async () => {
+    const global = await userConfig()
+    const override = await userConfig('override', join(directory, 'override'))
+    expect(
+      (await setup(undefined, { SKEPSIS_CLASSIFIER_CONFIG: override })).status.classifier
+        ?.model,
+    ).toBe('override')
+    await expect(
+      setup(undefined, { SKEPSIS_CLASSIFIER_CONFIG: join(directory, 'missing.json') }),
+    ).rejects.toThrow('classifier configuration')
+    await writeFile(global, 'invalid')
+    expect(
+      (
+        await setupReviewAgentWithEnvironment(
+          undefined,
+          { SKEPSIS_CLASSIFIER_CONFIG: 'missing' },
+          directory,
+          override,
+        )
+      ).status.classifier?.model,
+    ).toBe('override')
+    await expect(setup()).rejects.toThrow('classifier configuration')
+    expect((await setup(false)).models.getProviders()).toEqual([])
+  })
+
+  it('fails closed for an installed but dangling default config, and no-agent skips it', async () => {
+    const config = await userConfig()
+    await rm(config)
+    await symlink(join(directory, 'missing.json'), config)
+    await expect(setup()).rejects.toThrow('classifier configuration')
+    expect((await setup(false)).status).toEqual({ model: null, available: false })
+  })
   it('is opt-in: chat credentials alone expose no classifiers', async () => {
     const result = await setup(undefined, { OPENAI_API_KEY: 'fixture-key' })
     expect(result.status.codemode).toBe(true)

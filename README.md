@@ -5,8 +5,10 @@
 A local browser-based code review UI with a built-in review agent. Review a GitHub PR or your local jj/git diff, ask private questions on individual lines, and publish only the review comments you choose.
 
 - GitHub-style split or unified diff view with syntax highlighting
+- Collapsible, filterable file tree with viewed state and change counts
 - Mark files as viewed
-- Private, durable line conversations with an embedded Pi agent
+- Private, durable line conversations with Markdown rendering and an embedded Pi agent
+- Explicit parallel hunk-priority scoring with a configured decision classifier
 - Editable review-comment drafts, explicitly submitted to GitHub
 - No source-file changes when chatting or drafting
 - Works with [jj](https://jj-vcs.dev/) and git (tries jj first, falls back to git)
@@ -51,7 +53,10 @@ the commit range. The VCS is auto-detected. In jj mode, the flags are passed
 straight to `jj diff`. In git mode, they have to be translated slightly. See the
 examples below.
 
-Each invocation picks a free loopback port. Different reviews can run simultaneously, but only one server may own a given durable review session.
+Each invocation picks a free loopback port unless you set `--port <port>` (use `0`
+for automatic selection). A fixed port keeps browser URLs and SSH tunnels stable
+across restarts. Different reviews can run simultaneously, but only one server may
+own a given durable review session.
 
 ### GitHub PRs and embedded agent
 
@@ -93,6 +98,41 @@ Private means **not published to GitHub**: prompts and inspected code are sent t
 your configured chat provider and may also be sent to your decision endpoint.
 No inference is performed while idle.
 
+### Browser review workflow
+
+Use **Hide files / Show files** to collapse the left file tree. Filter by path
+(including a rename's old path), collapse folders, or click a file to jump to it.
+Navigation never marks files viewed. The tree tracks the focused file and viewed
+state; on narrow screens it becomes a bounded drawer above the diff.
+
+Private conversations render Markdown, including lists, tables, links and fenced
+code with a copy button. Raw HTML and remote images are disabled. **Write / Preview**
+shows how a question, proposal or draft will render without changing its source.
+**Create review comment** copies an answer into an editable, unpublished draft;
+copying, saving and publishing remain separate explicit actions.
+
+With a configured decision classifier, click **Prioritize hunks** to score the
+current displayed diff in parallel. Scores appear next to each hunk's first changed
+line; **Show priorities** lists them highest-first with links to the exact old/new
+line. **Discuss hunk** opens a private composer without sending anything.
+The file sidebar colors each file and folder by its **highest scored hunk**:
+gray for minimal, green for low, blue for normal, amber for high, and red for critical.
+Numeric scores and tooltips accompany the colors; `*` marks partial coverage, `?`
+uncertainty, `…` pending, and `—` unscored. Folder colors remain visible when collapsed.
+Colors clear when the reviewed revision changes, and navigation never marks files viewed.
+Scores are continuous expected review-attention levels (0 mechanical through 4
+critical), not confirmed defects. Uncertain results need human inspection; failed
+or oversized hunks are marked **Not scored**, never assigned a fake zero.
+
+Scoring sends only the original diff hunks to the configured classifier, not private
+conversation history. It shares the classifier's concurrency/queue limits and has
+its own **Stop scoring** control. There is no chat-model fallback or automatic retry.
+Revision changes invalidate scores. Batches are limited to 1,000 hunks and 24,000
+characters of classifier input per hunk; oversized hunks are skipped whole.
+Unlike durable conversations, priority results live only until the server restarts:
+browser reloads retain them, but restarting requires an explicit new scoring run.
+Nothing is edited, marked viewed, or published by scoring.
+
 ### Configuring a decision model
 
 Any endpoint implementing the **TypeSafe System One JSON protocol** can be used;
@@ -100,7 +140,10 @@ this is not restricted to a particular model or hosting provider. An OpenAI-comp
 chat/completions endpoint alone is not sufficient. Classifiers are opt-in and
 independent of `--model`, which selects the conversational reviewer.
 
-Create a trusted JSON configuration file, for example `~/.config/skepsis/classifier.json`:
+Create `~/.config/skepsis/classifier.json` to make a classifier your persistent
+default (or `$XDG_CONFIG_HOME/skepsis/classifier.json` when `XDG_CONFIG_HOME` is an
+absolute path). Skepsis loads it automatically; no extra launch flag is needed.
+For example:
 
 ```json
 {
@@ -109,15 +152,25 @@ Create a trusted JSON configuration file, for example `~/.config/skepsis/classif
   "endpoint": "http://127.0.0.1:8080/v1/systemone",
   "contextWindow": 32768,
   "maxRequestBytes": 131072,
-  "timeoutMs": 30000
+  "timeoutMs": 30000,
+  "maxConcurrency": 8,
+  "maxQueuedRequests": 64
 }
 ```
 
 ```sh
 skepsis https://github.com/owner/repo/pull/123 \
   --classifier-config ~/.config/skepsis/classifier.json
-# Alternatively set SKEPSIS_CLASSIFIER_CONFIG to the file's path.
+# Or just run skepsis when the config is in the default user location.
+# SKEPSIS_CLASSIFIER_CONFIG can also select a different file.
 ```
+
+Selection order is `--classifier-config`, `SKEPSIS_CLASSIFIER_CONFIG`, then the
+user default. A missing default means no classifier; an invalid selected config
+fails closed instead of choosing another endpoint. `--no-agent` skips all classifier
+configuration. To reuse a Pi classifier, copy only its model and connection settings
+into this user file; Skepsis does not execute Pi extensions or read project-local
+classifier configuration. Keep real endpoints and credentials outside the repository.
 
 `endpoint` is the **complete POST URL**, including any custom path; Skepsis does
 not append `/systemone`. Unauthenticated local servers work as shown. For bearer
@@ -130,7 +183,11 @@ conversation state, or the browser. No credential commands are executed.
 The endpoint receives `{ model, state, questions }`; public `bool` questions/results
 are mapped to/from System One's `noul` wire format. Choice probabilities and score
 results are normalized and validated. The agent can discover the model with
-`models.getAvailableOfType("classifier")` and invoke `models.classify()` from codemode.
+`models.getAvailableOfType("classifier")` and call
+`tools.classify_review({model, context: {state, questions}})` from codemode. This
+uses Pi Durable's native classifier tool and journals each result for recovery.
+The built-in `models.classify(model, context)` also works, but has a separate
+four-call per-script cap; use `classify_review` to make use of higher parallelism.
 It is instructed to check `stopReason`, interpret booleans as P(true) and scores as
 expected levels, and escalate ambiguous or consequential decisions rather than
 inventing answers. Classification is for narrow structured tasks, not prose.
@@ -138,10 +195,20 @@ inventing answers. Classification is for narrow structured tasks, not prose.
 Optional `cost: {"input": 0, "output": 0}` specifies prices per million tokens for
 usage accounting. `contextWindow` is advisory model metadata; `maxRequestBytes`
 limits actual JSON requests (maximum 16 MiB). No automatic truncation is performed.
-Requests time out after `timeoutMs` (maximum 60 seconds), responses are limited to
-1 MiB, and at most four requests run concurrently. Excess requests return an error;
-scripts should use small batches. HTTP redirects and automatic transport retries
-are disabled. Use HTTPS for remote services; HTTP sends request data unencrypted.
+Responses are limited to 1 MiB. `maxConcurrency` controls parallel classifier
+requests (default 4, range 1–64); raise it to match your endpoint's capacity.
+`maxQueuedRequests` bounds the shared FIFO waiting queue (default 64, range 0–256);
+set it to 0 to reject excess calls immediately. Overflow returns a sanitized error.
+The agent is instructed to batch independent scoring/classification items with
+`Promise.allSettled` or a bounded pool, checking each result's `stopReason` even
+when its promise fulfilled. Related questions over the same state can share one
+request. This parallelizes classifier calls, not conversational agent turns.
+
+Each request's `timeoutMs` (maximum 60 seconds) includes queue wait and execution;
+it is not reset on admission. Stop/Resolve cancels queued and running calls.
+Codemode's separate 60-second script limit still applies. HTTP redirects and
+automatic transport retries are disabled. Use HTTPS for remote services; HTTP
+sends request data unencrypted.
 
 The CLI and Review panel show the selected endpoint. Changing configuration on
 restart cancels unfinished old-policy work rather than redirecting it to a new
@@ -191,9 +258,32 @@ reload from a source checkout.
 
 ### Conversations and review comments
 
-Use the gutter `+` on either side of the diff to **Ask agent (private)** or save a
-**Draft review comment**. Follow-ups stay in their line's conversation. An agent
-answer can be copied into an editable review draft; doing so never publishes it.
+Click a line number or the gutter `+` on either side of the diff to **Ask agent
+(private)**, **Propose a change (private)**, or save a **Draft review comment**.
+Per-line composition remains available before and after hunk prioritization;
+**Discuss hunk** is an additional shortcut, not a replacement. Follow-ups stay
+in their line's conversation. An agent answer can be copied into an editable
+review draft; doing so never publishes it.
+
+To request a fix, choose **Propose a change (private)** and describe what should
+change. In an existing thread, **Propose a change** uses your follow-up text, or
+asks for a minimal fix to the issue already discussed. **Use comment as change
+request** copies a draft comment (including unsaved edits) into the private request
+composer without changing or saving that draft; sending remains explicit.
+
+Proposals are private answers, not file edits or automatically created public
+comments. The agent is instructed to give a minimal change and rationale. A
+verified single-line RIGHT-side replacement can use a GitHub `suggestion` block;
+broader changes and LEFT-side anchors use a fenced diff with paths and scope.
+Check the proposal, then use **Create review comment** and **Save draft** if you
+want to include it in a public review. Nothing applies the proposed code locally.
+
+The authenticated API hooks are `POST /api/threads` with
+`{ id, anchor, text, intent: "propose-change" }` and
+`POST /api/threads/:id/messages` with `{ id, text, intent: "propose-change" }`.
+They use the same session-token, revision, provider-consent, and cancellation
+checks as questions. Omitted intent means `"question"`; request IDs must be UUIDs.
+
 Local revision comparisons support conversations too, even when they don't end
 at the working copy. Changes to any tracked working-copy dependency invalidate
 old context, even in path-filtered reviews. Unsaved compositions remain recoverable
@@ -229,9 +319,17 @@ on the next launch only when its revision and provider remain valid. Stop/Resolv
 cancels it, including while publication is in flight. Resolved threads remain in
 the Review panel.
 
-Existing `<review>` source blocks remain ordinary visible source text. The legacy
-source-comment/worker APIs are not used by this interface; no source comments are
-created or removed by the new conversation flow.
+The source-backed comment system and external-worker queue have been removed,
+including their storage helpers, discovery protocol, and `poll`/`answer`/`fail`
+clients. Old API URLs return HTTP 410 and removed CLI commands fail with a
+migration message. Existing `<review>` blocks remain ordinary visible source;
+they are not parsed, migrated, hidden, edited, or deleted by Skepsis. No source
+comments are created by the conversation flow.
+
+Browser file expansion and agent tools share bounded, symlink-safe working-file
+reads. Expansion only reads tracked files at the selected endpoints; traversal,
+repository metadata, ignored/untracked working files, and binary/oversized files
+are not exposed.
 
 ### Marking files viewed
 
@@ -273,7 +371,7 @@ npm run ci
 - **patch** — bug fixes, dependency bumps, internal changes
 - **minor** — new features: flags, keyboard shortcuts, UI capabilities
 - **major** — breaking changes to anything scriptable or on disk: removed or
-  renamed flags, changed flag defaults, changed `<review>` comment or
+  renamed flags, changed flag defaults, changed review API or
   viewed-state formats
 
 ## Releases
