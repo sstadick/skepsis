@@ -20,6 +20,7 @@ import { registerBunOAuthFlows } from '@earendil-works/pi-ai/bun-oauth'
 import { anthropicProvider } from '@earendil-works/pi-ai/providers/anthropic'
 import { openaiProvider } from '@earendil-works/pi-ai/providers/openai'
 import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex'
+import { githubCopilotProvider } from '@earendil-works/pi-ai/providers/github-copilot'
 import type { ReviewSnapshot } from '../shared/review.ts'
 import { loadReviewClassifier } from './reviewClassifier.ts'
 
@@ -255,7 +256,10 @@ export async function setupReviewAgentWithEnvironment(
     },
     authContext: { env: async (name) => env[name], fileExists: async () => false },
   })
-  const result: Setup = { models, status: { model: null, available: false } }
+  const result: Setup = {
+    models,
+    status: { model: null, available: false, enabled: modelOption !== false },
+  }
   if (modelOption === false) return result
   models.setProvider(anthropicProvider())
   const openai = openaiProvider()
@@ -263,6 +267,7 @@ export async function setupReviewAgentWithEnvironment(
   // service. Codemode exposes only the classifier explicitly configured here.
   models.setProvider({ ...openai, getAllModels: () => openai.getModels() })
   models.setProvider(openaiCodexProvider())
+  models.setProvider(githubCopilotProvider())
   result.status.codemode = true
   result.toolPolicyKey = `review-codemode-v2:${classifier?.policyKey ?? 'no-classifier'}`
   if (classifier) {
@@ -290,6 +295,7 @@ export async function setupReviewAgentWithEnvironment(
         ['anthropic', 'claude-sonnet-4-5'],
         ['openai', 'gpt-5-mini'],
         ['openai-codex', 'gpt-5.3-codex'],
+        ['github-copilot', 'gpt-5.3-codex'],
       ]
       for (const [provider, id] of defaults) {
         const available = await models.getAvailable(provider)
@@ -302,7 +308,7 @@ export async function setupReviewAgentWithEnvironment(
     }
     if (!selection) {
       result.status.error =
-        'No review model configured. Set --model provider/modelId or SKEPSIS_MODEL and configure Pi auth or an API key. Supported providers: anthropic, openai, openai-codex.'
+        'No review model configured. Set --model provider/modelId or SKEPSIS_MODEL and configure Pi auth or an API key. Supported providers: anthropic, openai, openai-codex, github-copilot.'
       return result
     }
     const slash = selection.indexOf('/')
@@ -310,7 +316,7 @@ export async function setupReviewAgentWithEnvironment(
     const modelId = selection.slice(slash + 1)
     if (slash < 1 || !models.getModel(provider, modelId)) {
       result.status.error =
-        'Unknown review model. Use provider/modelId from the Pi catalog. Supported providers: anthropic, openai, openai-codex.'
+        'Unknown review model. Use provider/modelId from the Pi catalog. Supported providers: anthropic, openai, openai-codex, github-copilot.'
       return result
     }
     result.status.model = selection

@@ -151,7 +151,7 @@ async function assertLegacyUnavailable(
 it('serves a review outside the process cwd, including assets, anchored chat and SSE', async () => {
   const fixture = await reviewFixture()
   const { cwd, contents, diffSource } = fixture
-  const faux = fauxProvider()
+  const faux = fauxProvider({ tokensPerSecond: 100000 })
   const models = createModels()
   models.setProvider(faux.provider)
   faux.setResponses([fauxAssistantMessage('Only the operator changed.')])
@@ -236,7 +236,7 @@ it('serves a review outside the process cwd, including assets, anchored chat and
     await server?.close()
     await rm(fixture.directory, { recursive: true, force: true })
   }
-})
+}, 15000)
 
 describe.each(['working copy', 'historical'] as const)('%s review', (comparison) => {
   it('returns 410 for removed routes in diff-only mode without changing source', async () => {

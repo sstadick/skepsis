@@ -1,0 +1,229 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, you can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * Copyright Oxide Computer Company
+ */
+
+.agent-review-panel,
+.agent-finding {
+  box-sizing: border-box;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  color: var(--fg);
+  font:
+    13px/1.6 system-ui,
+    sans-serif;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.agent-review-panel {
+  flex-shrink: 0;
+  max-height: 60vh;
+  overflow: auto;
+  padding: 12px;
+}
+
+.agent-review-toolbar,
+.agent-review-run-header,
+.agent-finding-header,
+.agent-finding-location,
+.agent-review-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.agent-review-toolbar > span,
+.agent-review-progress {
+  color: var(--fg-muted);
+}
+
+.agent-review-panel button,
+.agent-review-panel select,
+.agent-finding button {
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-control);
+  color: var(--fg);
+  min-height: 32px;
+  padding: 5px 10px;
+  font: inherit;
+  cursor: pointer;
+  max-width: 100%;
+}
+
+.agent-review-panel button:hover:not(:disabled),
+.agent-finding button:hover:not(:disabled) {
+  background: var(--bg-control-hover);
+}
+
+.agent-review-panel button:disabled,
+.agent-finding button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.agent-review-panel :is(button, select, textarea):focus-visible,
+.agent-finding :is(button, textarea):focus-visible {
+  outline: 2px solid var(--blue-text);
+  outline-offset: 3px;
+}
+
+.agent-review-panel label {
+  display: block;
+  margin: 10px 0;
+  color: var(--fg-bright);
+  font-weight: 500;
+}
+
+.agent-review-panel label select,
+.agent-review-panel label textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  margin-top: 4px;
+}
+
+.agent-review-panel textarea,
+.agent-finding textarea {
+  min-height: 100px;
+  resize: vertical;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-code);
+  color: var(--fg);
+  padding: 10px;
+  font: 13px/1.6 var(--font-mono);
+}
+
+.agent-review-panel [role='alert'],
+.agent-finding [role='alert'] {
+  color: var(--red);
+}
+
+.agent-review-run {
+  margin-top: 12px;
+  padding: 12px;
+  background: var(--bg-code);
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+}
+
+.agent-review-run-header > strong {
+  color: var(--fg-bright);
+  font-family: var(--font-mono);
+}
+
+.agent-review-run h3 {
+  margin-bottom: 4px;
+  color: var(--fg-bright);
+  font-size: 14px;
+}
+
+.agent-review-pill {
+  display: inline-block;
+  padding: 1px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--bg-muted);
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+.agent-review-pill[data-tone='warning'] {
+  color: var(--amber);
+}
+
+.agent-review-pill[data-tone='success'] {
+  color: var(--green-text);
+}
+
+.agent-review-findings {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.agent-finding {
+  padding: 10px;
+}
+
+.agent-finding-location {
+  color: var(--fg-muted);
+  font: 12px/1.5 var(--font-mono);
+  margin-top: 6px;
+}
+
+.agent-finding-location > span {
+  min-width: 0;
+  flex: 1;
+}
+
+.agent-review-actions {
+  margin-top: 8px;
+}
+
+.finding-chat {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.finding-chat-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.finding-chat-heading > span,
+.finding-chat-note,
+.finding-chat-disabled {
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.finding-chat-content {
+  margin-top: 10px;
+}
+
+.finding-chat-turn {
+  margin: 10px 0;
+}
+
+.finding-chat-message {
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--bg-code);
+}
+
+.finding-chat-answer {
+  margin-top: 6px;
+  background: var(--bg-muted);
+}
+
+.finding-chat-message > strong {
+  color: var(--fg-bright);
+}
+
+.finding-chat-content label {
+  display: block;
+  margin: 10px 0 4px;
+  color: var(--fg-bright);
+  font-weight: 500;
+}
+
+.finding-chat-content textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 72px;
+  margin-bottom: 8px;
+}

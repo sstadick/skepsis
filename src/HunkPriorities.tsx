@@ -6,7 +6,7 @@
  * Copyright Oxide Computer Company
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   hasPriorityScore,
@@ -17,6 +17,7 @@ import {
 import type { ReviewAnchor, ReviewSnapshot } from '../shared/review.ts'
 import { reviewRequest } from './ReviewPanel.tsx'
 import './priorities.css'
+import { ReviewTool, useReviewTool } from './ReviewToolbar.tsx'
 
 export function currentPriorities(snapshot?: PrioritySnapshot, revision?: string) {
   return snapshot && snapshot.revision === revision && snapshot.status !== 'stale'
@@ -153,7 +154,7 @@ export function HunkPriorities({
   classifier?: ReviewSnapshot['agent']['classifier']
   onNavigate: (anchor: ReviewAnchor) => void
 }) {
-  const [expanded, setExpanded] = useState(false)
+  const { open: expanded, setOpen: setExpanded } = useReviewTool('priorities')
   const snapshot = priorities.data
   const stale = snapshot?.status === 'stale' || snapshot?.revision !== revision
   const running = snapshot?.status === 'running'
@@ -167,59 +168,82 @@ export function HunkPriorities({
     [priorities.results],
   )
   const error = priorities.start.error ?? priorities.cancel.error ?? priorities.error
+  const startButton = (
+    <button
+      type="button"
+      disabled={
+        !!disabledReason || !snapshot?.available || running || priorities.start.isPending
+      }
+      title={
+        disabledReason ??
+        'Send the displayed diff hunks to the configured classifier for review-attention scores'
+      }
+      onClick={() => {
+        priorities.cancel.reset()
+        priorities.start.mutate()
+      }}
+    >
+      Prioritize hunks
+    </button>
+  )
+  const stopButton = running && (
+    <button
+      type="button"
+      disabled={priorities.cancel.isPending}
+      onClick={() => priorities.cancel.mutate(snapshot)}
+    >
+      Stop scoring
+    </button>
+  )
   return (
-    <section className="hunk-priorities" aria-label="Hunk priorities">
-      <div className="hunk-priority-toolbar">
-        <button
-          type="button"
-          disabled={
-            !!disabledReason ||
-            !snapshot?.available ||
-            running ||
-            priorities.start.isPending
-          }
-          title={
-            disabledReason ??
-            'Send the displayed diff hunks to the configured classifier for review-attention scores'
-          }
-          onClick={() => {
-            priorities.cancel.reset()
-            priorities.start.mutate()
-          }}
-        >
-          Prioritize hunks
-        </button>
-        <span className="hunk-priority-status" role="status">
-          {!snapshot
-            ? 'Loading…'
-            : !snapshot.available
-              ? 'Configure a classifier to enable scoring'
-              : stale
-                ? 'Diff changed — prioritize again'
-                : running
-                  ? `Scoring ${snapshot.completed}/${snapshot.total} hunks`
-                  : snapshot.status === 'idle'
-                    ? 'Find where to focus your review'
-                    : `${snapshot.completed}/${snapshot.total} processed${snapshot.status === 'cancelled' ? ' · stopped' : ''}`}
-        </span>
-        {running && (
+    <ReviewTool
+      id="priorities"
+      className="hunk-priorities"
+      heading="Priorities"
+      actions={
+        <>
+          {startButton}
+          {running && (
+            <span className="review-tool-state" role="status">
+              Scoring {snapshot.completed}/{snapshot.total}
+            </span>
+          )}
+          {stopButton}
+          {error && (
+            <span className="review-tool-state" data-tone="error" title={error.message}>
+              Scoring failed
+            </span>
+          )}
+        </>
+      }
+      toolbar={
+        <div className="hunk-priority-toolbar">
+          {startButton}
+          <span className="hunk-priority-status" role="status">
+            {!snapshot
+              ? 'Loading…'
+              : !snapshot.available
+                ? 'Configure a classifier to enable scoring'
+                : stale
+                  ? 'Diff changed — prioritize again'
+                  : running
+                    ? `Scoring ${snapshot.completed}/${snapshot.total} hunks`
+                    : snapshot.status === 'idle'
+                      ? 'Find where to focus your review'
+                      : `${snapshot.completed}/${snapshot.total} processed${snapshot.status === 'cancelled' ? ' · stopped' : ''}`}
+          </span>
+          {stopButton}
           <button
             type="button"
-            disabled={priorities.cancel.isPending}
-            onClick={() => priorities.cancel.mutate(snapshot)}
+            aria-expanded={expanded}
+            aria-controls="hunk-priority-details"
+            onClick={() => setExpanded(!expanded)}
           >
-            Stop scoring
+            {expanded ? 'Hide priorities' : 'Show priorities'}
           </button>
-        )}
-        <button
-          type="button"
-          aria-expanded={expanded}
-          aria-controls="hunk-priority-details"
-          onClick={() => setExpanded(!expanded)}
-        >
-          {expanded ? 'Hide priorities' : 'Show priorities'}
-        </button>
-      </div>
+        </div>
+      }
+    >
       {error && <p role="alert">{error.message}</p>}
       {snapshot?.error && !stale && <p role="alert">{snapshot.error}</p>}
       <div id="hunk-priority-details" hidden={!expanded}>
@@ -266,6 +290,6 @@ export function HunkPriorities({
           <p className="hunk-priority-help">No text hunks to score in this diff.</p>
         )}
       </div>
-    </section>
+    </ReviewTool>
   )
 }

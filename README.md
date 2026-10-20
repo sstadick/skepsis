@@ -8,6 +8,8 @@ A local browser-based code review UI with a built-in review agent. Review a GitH
 - Collapsible, filterable file tree with viewed state and change counts
 - Mark files as viewed
 - Private, durable line conversations with Markdown rendering and an embedded Pi agent
+- Read-only published GitHub PR discussion, separate from private conversations and drafts
+- On-demand whole-diff Agent Review with individually accepted draft suggestions
 - Explicit parallel hunk-priority scoring with a configured decision classifier
 - Editable review-comment drafts, explicitly submitted to GitHub
 - No source-file changes when chatting or drafting
@@ -72,20 +74,27 @@ and leaves your working checkout untouched. Relaunch the URL to review a new PR
 revision; old conversations and drafts remain accessible as outdated, not silently
 reattached to different code.
 
+The **Published on GitHub** section shows existing PR conversation comments,
+published review summaries and inline threads with replies, including resolved
+and outdated threads. This is read-only GitHub discussion, not private agent chat
+or local drafts. It uses your authenticated `gh` CLI credentials; click
+**Refresh comments** to fetch newer discussion; there is no background polling.
+Fetches paginate with limits and fail rather than showing incomplete discussion.
+
 An agent can launch this command, keep the server process alive, and give you the
 printed URL. It does **not** need to poll for questions or relay answers. The
 embedded agent owns the conversation independently.
 
 Model selection uses `--model`, then `SKEPSIS_MODEL`, then Pi's
-`defaultProvider/defaultModel` settings, then an available default. Initially,
-Anthropic, OpenAI and OpenAI Codex providers are supported. Credentials come from
-Pi's `~/.pi/agent/auth.json` (or `PI_CODING_AGENT_DIR`) or provider environment
-variables such as `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`. OAuth refresh shares
-Pi's credential-file lock. Shell-command credentials and custom `models.json`
-providers are not loaded. Use `--no-agent` to pause model work. When a different
-provider is selected, existing threads require explicit consent before their
-retained private history can be sent there; interrupted work is not automatically
-requeued. New threads use the selected provider.
+`defaultProvider/defaultModel` settings, then an available default. Anthropic,
+OpenAI, OpenAI Codex and GitHub Copilot providers are supported. Credentials
+come from Pi's `~/.pi/agent/auth.json` (or `PI_CODING_AGENT_DIR`) or provider
+environment variables such as `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`. OAuth
+refresh shares Pi's credential-file lock. Shell-command credentials and custom
+`models.json` providers are not loaded. Use `--no-agent` to pause model work.
+When a different provider is selected, existing threads require explicit consent
+before their retained private history can be sent there; interrupted work is not
+automatically requeued. New threads use the selected provider.
 
 The agent has bounded, read-only file/list/search tools, not Bash or GitHub write
 access. Working-copy symlinks are rejected, including links to ignored secrets.
@@ -132,6 +141,34 @@ characters of classifier input per hunk; oversized hunks are skipped whole.
 Unlike durable conversations, priority results live only until the server restarts:
 browser reloads retain them, but restarting requires an explicit new scoring run.
 Nothing is edited, marked viewed, or published by scoring.
+
+### Agent Review
+
+Open **Agent Review** to run an explicit review of the entire original diff at
+the current pinned revision. Write a custom review prompt, choose an available
+authenticated chat model and one of its supported reasoning levels, then click
+**Start review**. The default prompt asks for actionable findings using
+Conventional Comments. Runs and findings are durable in the same Pi review store
+as private conversations; they are not GitHub comments. `--no-agent` pauses model
+work, including Agent Review.
+
+Each finding starts as a private pending suggestion. Inspect it, then individually
+**Accept for review** to create an editable, unpublished review draft, or
+**Dismiss** it. Acceptance does not select the draft for publication or publish
+anything: edit the saved draft if needed, then select, preview and confirm a
+GitHub review separately. Findings tied to an outdated revision cannot be
+accepted. Agent Review requires the _entire original diff_ (not just
+visible/expanded browser hunks) to fit a hard 128,000 UTF-8-byte limit; an
+oversized diff is rejected, not silently truncated. Narrow the comparison to
+fewer files before starting again.
+
+Use **Chat with agent** on a suggestion to ask for evidence, clarification, or a
+reassessment before deciding. Follow-ups use the original review conversation,
+diff, model, and reasoning level; private replies stay attached to that finding
+and survive reloads. Opening chat does not run the agent. Send explicitly, or
+**Stop reply** to cancel. Chat never changes suggestions or saved drafts, accepts
+findings, or publishes anything. Outdated reviews and `--no-agent` keep history
+readable but disable new messages.
 
 ### Configuring a decision model
 

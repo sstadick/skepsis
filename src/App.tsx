@@ -55,6 +55,12 @@ import {
   bufferAnchors,
 } from './ReviewPanel.tsx'
 import type { ReviewAnchor } from '../shared/review.ts'
+import type { GitHubReviewThread } from '../shared/githubComments.ts'
+import type { AgentReviewFinding } from '../shared/agentReview.ts'
+import { GitHubCommentsPanel, GitHubThread, useGitHubComments } from './GitHubComments.tsx'
+import { AgentReviewPanel, AgentFinding } from './AgentReview.tsx'
+import { githubReviewAnchors } from './reviewAnnotations.ts'
+import { ReviewToolbar } from './ReviewToolbar.tsx'
 import {
   FileSidebar,
   FileSidebarToggle,
@@ -140,6 +146,8 @@ type AnnotationMeta = {
   anchor: ReviewAnchor
   conversation: boolean
   priority?: HunkPriority
+  github?: GitHubReviewThread[]
+  findings?: { runId: string; finding: AgentReviewFinding }[]
 }
 
 // In split mode the diffs library renders pure adds ('new') and pure deletes
@@ -572,6 +580,7 @@ function DiffView() {
   // re-parsed with whole-file context so every collapsed region is revealed.
   const [expandedFiles, setExpandedFiles] = useState<Record<string, boolean>>({})
   const review = useReview()
+  const githubComments = useGitHubComments(review.data?.pullRequest)
   const [composing, setComposing] = useState<{
     file: string
     line: number
@@ -923,6 +932,29 @@ function DiffView() {
   // idempotent per key and versions only increase, so a StrictMode double
   // render or a discarded concurrent render can't produce an inconsistent
   // version for a given key.
+  const githubAnchors = useMemo(
+    () =>
+      githubReviewAnchors(
+        githubComments.data,
+        review.data?.pullRequest,
+        data?.reviewRevision,
+        files,
+      ),
+    [githubComments.data, review.data?.pullRequest, data?.reviewRevision, files],
+  )
+  const pendingFindings = useMemo(
+    () =>
+      (review.data?.agentReviews ?? []).flatMap((run) =>
+        run.findings
+          .filter(
+            (finding) =>
+              finding.status === 'pending' &&
+              finding.anchor.revision === data?.reviewRevision,
+          )
+          .map((finding) => ({ runId: run.id, finding })),
+      ),
+    [review.data?.agentReviews, data?.reviewRevision],
+  )
   const versionsRef = useRef(new Map<string, { key: string; version: number }>())
   const items = useMemo<CodeViewDiffItem<AnnotationMeta>[]>(() => {
     if (!data) return []
@@ -951,6 +983,11 @@ function DiffView() {
       // Merge the score with any conversation at the same line: CodeView's
       // annotation slots are keyed by line/side, not by the feature using them.
       const conversations = new Set(grouped.keys())
+      const remote = githubAnchors.filter((entry) => entry.anchor.path === name)
+      const findings = pendingFindings.filter((entry) => entry.finding.anchor.path === name)
+      for (const { anchor } of remote) grouped.set(anchorKey(anchor), anchor)
+      for (const { finding } of findings)
+        grouped.set(anchorKey(finding.anchor), finding.anchor)
       const byAnchor = new Map(
         hunkPriorities
           .filter((hunk) => hunk.path === name)
@@ -966,6 +1003,10 @@ function DiffView() {
             anchor,
             conversation: conversations.has(key),
             priority: byAnchor.get(key),
+            github: remote
+              .filter((entry) => anchorKey(entry.anchor) === key)
+              .map((entry) => entry.thread),
+            findings: findings.filter((entry) => anchorKey(entry.finding.anchor) === key),
           },
         }),
       )
@@ -998,6 +1039,8 @@ function DiffView() {
     review.data,
     review.text,
     hunkPriorities,
+    githubAnchors,
+    pendingFindings,
   ])
   itemsRef.current = items
 
@@ -1183,6 +1226,18 @@ function DiffView() {
               }}
             />
           )}
+          {meta.github?.map((thread) => (
+            <GitHubThread key={thread.id} thread={thread} />
+          ))}
+          {meta.findings?.map(({ runId, finding }) => (
+            <AgentFinding
+              key={finding.id}
+              runId={runId}
+              finding={finding}
+              review={review}
+              displayedRevision={meta.anchor.revision}
+            />
+          ))}
           {meta.conversation && (
             <LineChat
               anchor={meta.anchor}
@@ -1574,7 +1629,11 @@ function DiffView() {
   if (!patch)
     return (
       <>
-        <ReviewPanel review={review} />
+        <ReviewToolbar>
+          <ReviewPanel review={review} />
+          <AgentReviewPanel review={review} displayedRevision={data.reviewRevision} />
+          {review.data?.pullRequest && <GitHubCommentsPanel comments={githubComments} />}
+        </ReviewToolbar>
         <div className="empty-diff">
           <code>{data.revset}</code> is empty
         </div>
@@ -1623,15 +1682,36 @@ function DiffView() {
           onSelect={selectSidebarFile}
         />
         <main className="diff-container">
-          {review.data && data.reviewRevision && (
-            <HunkPriorities
-              priorities={priorities}
-              revision={data.reviewRevision}
-              classifier={review.data.agent.classifier}
+          <ReviewToolbar>
+            {review.data && data.reviewRevision && (
+              <HunkPriorities
+                priorities={priorities}
+                revision={data.reviewRevision}
+                classifier={review.data.agent.classifier}
+                onNavigate={selectPriorityHunk}
+              />
+            )}
+            <ReviewPanel review={review} />
+            <AgentReviewPanel
+              review={review}
               onNavigate={selectPriorityHunk}
+              displayedRevision={data.reviewRevision}
             />
-          )}
-          <ReviewPanel review={review} />
+            {review.data?.pullRequest && (
+              <GitHubCommentsPanel
+                comments={githubComments}
+                canNavigate={(thread) =>
+                  githubAnchors.some((entry) => entry.thread.id === thread.id)
+                }
+                onNavigate={(thread) => {
+                  const target = githubAnchors.find(
+                    (entry) => entry.thread.id === thread.id,
+                  )
+                  if (target) selectPriorityHunk(target.anchor)
+                }}
+              />
+            )}
+          </ReviewToolbar>
           {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
           <CodeView
             ref={codeViewRef}

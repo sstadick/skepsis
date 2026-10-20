@@ -1,0 +1,191 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, you can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * Copyright Oxide Computer Company
+ */
+
+.github-comments-panel,
+.github-thread {
+  box-sizing: border-box;
+  min-width: 0;
+  background: var(--bg-panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font:
+    13px/1.6 system-ui,
+    -apple-system,
+    sans-serif;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.github-comments-panel {
+  flex-shrink: 0;
+  max-height: 55vh;
+  overflow: auto;
+  padding: 12px 16px;
+  scrollbar-gutter: stable;
+}
+
+.github-comments-heading {
+  color: var(--fg-bright);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.github-comments-count,
+.github-thread-label {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--bg-muted);
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.github-comments-count {
+  margin-left: 6px;
+}
+
+.github-comments-content {
+  margin-top: 12px;
+}
+
+.github-comments-toolbar,
+.github-thread-heading,
+.github-comment-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.github-comments-toolbar {
+  justify-content: space-between;
+}
+
+.github-comments-toolbar p {
+  margin: 0;
+  color: var(--fg-muted);
+}
+
+.github-comments-panel button,
+.github-thread button {
+  box-sizing: border-box;
+  min-height: 30px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-control);
+  color: var(--fg);
+  padding: 5px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.github-comments-panel button:hover:not(:disabled),
+.github-thread button:hover:not(:disabled) {
+  background: var(--bg-control-hover);
+  border-color: var(--border-muted);
+}
+
+.github-comments-panel button:disabled,
+.github-thread button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+:where(.github-comments-panel, .github-thread)
+  :is(summary, button, a, [tabindex]):focus-visible {
+  outline: 2px solid var(--blue-text);
+  outline-offset: 3px;
+}
+
+.github-comments-panel [role='alert'] {
+  color: var(--red);
+}
+
+.github-comments-section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.github-comments-section h3 {
+  margin: 0 0 10px;
+  color: var(--fg-bright);
+  font-size: 14px;
+}
+
+.github-comments-list {
+  display: grid;
+  gap: 10px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+  min-width: 0;
+}
+
+.github-published-comment {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--bg-code);
+}
+
+.github-comment-heading {
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.github-comment-heading strong,
+.github-thread-location {
+  color: var(--fg-bright);
+}
+
+.github-comment-heading a {
+  margin-left: auto;
+  color: var(--blue-text);
+  text-underline-offset: 3px;
+}
+
+.github-comment-state {
+  text-transform: capitalize;
+  color: var(--fg-dim);
+}
+
+.github-thread {
+  padding: 12px;
+  background: var(--bg-muted);
+}
+
+.github-thread-heading {
+  margin-bottom: 10px;
+}
+
+.github-thread-location {
+  min-width: 0;
+  font: 12px/1.5 var(--font-mono);
+}
+
+.github-thread-label[data-tone='warning'] {
+  color: var(--amber);
+}
+
+.github-thread-heading button {
+  margin-left: auto;
+}
+
+@media (max-width: 600px) {
+  .github-comments-panel,
+  .github-thread {
+    padding: 12px;
+  }
+}

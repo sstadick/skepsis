@@ -28,6 +28,8 @@ import { priorityRequestSchema } from '../shared/priorities.ts'
 import { createReviewPriorities, PriorityRequestError } from './reviewPriorities.ts'
 import { openReviewStore, ReviewRequestConflict, type ReviewStore } from './reviewStore.ts'
 import { createReviewContext, ReviewValidationError } from './reviewContext.ts'
+import { mountAgentReviewApi } from './agentReviewApi.ts'
+import { mountGitHubCommentsApi } from './githubCommentsApi.ts'
 import {
   preflightReview,
   findPublishedReview,
@@ -64,8 +66,9 @@ export async function mountReviewApi(
   // Progress snapshots must not spawn git/jj. Refresh on diff reloads and anchor
   // actions, including rejected stale actions so the browser can recover.
   let revision = (await context.current()).revision
-  const updateRevision = (next: string) => {
+  const updateRevision = async (next: string) => {
     if (next !== revision) {
+      await store.updateRevision(next)
       revision = next
       priorities.invalidate(next)
       opts.publish()
@@ -79,7 +82,7 @@ export async function mountReviewApi(
     classifierConcurrency: opts.review.classifierConcurrency,
     current: async (signal) => {
       const state = await context.current(signal)
-      updateRevision(state.revision)
+      await updateRevision(state.revision)
       return state
     },
     publish: opts.publish,
@@ -100,6 +103,7 @@ export async function mountReviewApi(
     ...opts.review,
     cwd: opts.cwd,
     currentRevision: revision,
+    inferenceEnabled: opts.review.agent.enabled ?? opts.review.agent.available,
     tools: context.tools,
     onChange: opts.publish,
   })
@@ -115,11 +119,18 @@ export async function mountReviewApi(
     )
       return c.json({ error: 'Forbidden origin or host' }, 403)
     const path = c.req.path
-    if (['/api/diff', '/api/review', '/api/session', '/api/priorities'].includes(path))
+    if (
+      ['/api/diff', '/api/review', '/api/session', '/api/priorities'].includes(path) ||
+      path.startsWith('/api/github/') ||
+      path.startsWith('/api/agent-review')
+    )
       c.header('Cache-Control', 'no-store')
     const mutation =
       !['GET', 'HEAD', 'OPTIONS'].includes(c.req.method) &&
-      (path === '/api/priorities' ||
+      (path === '/api/agent-review' ||
+        path.startsWith('/api/agent-review/') ||
+        path.startsWith('/api/github/') ||
+        path === '/api/priorities' ||
         path.startsWith('/api/priorities/') ||
         path === '/api/threads' ||
         path.startsWith('/api/threads/') ||
@@ -130,7 +141,8 @@ export async function mountReviewApi(
       return c.json({ error: 'Invalid session token' }, 403)
     const serialized =
       mutation &&
-      (path === '/api/drafts' ||
+      ((path.startsWith('/api/agent-review/') && path.endsWith('/accept')) ||
+        path === '/api/drafts' ||
         path.startsWith('/api/drafts/') ||
         path.startsWith('/api/review/'))
     if (!serialized) {
@@ -158,6 +170,9 @@ export async function mountReviewApi(
   app.use('/api/threads', bodyLimit({ maxSize: 65536 }))
   app.use('/api/drafts', bodyLimit({ maxSize: 65536 }))
   app.use('/api/review/*', bodyLimit({ maxSize: 65536 }))
+  app.use('/api/agent-review', bodyLimit({ maxSize: 65536 }))
+  app.use('/api/agent-review/*', bodyLimit({ maxSize: 65536 }))
+  app.use('/api/github/*', bodyLimit({ maxSize: 65536 }))
   app.use('/api/priorities', bodyLimit({ maxSize: 65536 }))
   app.use('/api/priorities/*', bodyLimit({ maxSize: 65536 }))
   // Route-local boundary: legacy endpoints retain their own error handling.
@@ -184,6 +199,15 @@ export async function mountReviewApi(
       agent: opts.review.agent,
     } satisfies ReviewSnapshot),
   )
+  mountGitHubCommentsApi(app, opts.review.pullRequest)
+  mountAgentReviewApi(app, {
+    store,
+    context,
+    models: opts.review.models,
+    enabled: opts.review.agent.enabled ?? opts.review.agent.available,
+    defaultModel: opts.review.model,
+    updateRevision,
+  })
   app.get('/api/priorities', (c) => c.json(priorities.snapshot()))
   app.post('/api/priorities', async (c) => {
     const parsed = priorityRequestSchema.safeParse(await c.req.json().catch(() => null))

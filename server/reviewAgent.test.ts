@@ -76,9 +76,18 @@ describe('review agent selection', () => {
   it('disables admissions even with credentials and invalid settings', async () => {
     await writeFile(join(directory, 'settings.json'), 'invalid')
     const result = await setup(false, { OPENAI_API_KEY: 'fixture-key' })
-    expect(result.status).toEqual({ model: null, available: false })
+    expect(result.status).toEqual({ model: null, available: false, enabled: false })
     expect(result.model).toBeUndefined()
     expect(result.models.getProviders()).toEqual([])
+  })
+
+  it('loads the Pi Copilot model catalog without contacting the provider', async () => {
+    await writeFile(path, JSON.stringify({ 'github-copilot': oauth }))
+    const result = await setup('github-copilot/gpt-5.3-codex')
+    expect(result.status.enabled).toBe(true)
+    expect(result.status.available).toBe(true)
+    expect(result.model?.provider).toBe('github-copilot')
+    expect(JSON.parse(await readFile(path, 'utf8'))['github-copilot']).toEqual(oauth)
   })
 
   it('reports unsupported models and missing auth without throwing', async () => {
@@ -198,7 +207,11 @@ describe('configured decision models', () => {
     await rm(config)
     await symlink(join(directory, 'missing.json'), config)
     await expect(setup()).rejects.toThrow('classifier configuration')
-    expect((await setup(false)).status).toEqual({ model: null, available: false })
+    expect((await setup(false)).status).toEqual({
+      model: null,
+      available: false,
+      enabled: false,
+    })
   })
   it('is opt-in: chat credentials alone expose no classifiers', async () => {
     const result = await setup(undefined, { OPENAI_API_KEY: 'fixture-key' })

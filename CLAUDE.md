@@ -2,9 +2,9 @@
 
 Local diff review UI: a CLI starts an HTTP server that serves a web app for
 reviewing a GitHub PR or jj/git diff in the browser (per-file viewed state,
-keyboard navigation, private Pi Durable line conversations, and editable
-review drafts explicitly published to GitHub). The normal UI never writes
-comments into source files.
+keyboard navigation, read-only published PR discussion, private Pi Durable line
+conversations and whole-diff Agent Review, and editable review drafts explicitly
+published to GitHub). The normal UI never writes comments into source files.
 
 After changes, run `npm run ci` unless narrowing is clearly justified. That
 runs the build, type-check, oxlint, oxfmt check, and tests. Use `npm run fmt`
@@ -46,28 +46,41 @@ server/
                       private text, never edits or automatically saved drafts.
   reviewPriorities.ts Explicit bounded classifier-only hunk-priority batches;
                       original-patch anchors, ephemeral results, cancellation.
+  githubComments.ts   Read-only, bounded/paginated GitHub PR discussion via gh.
+  githubCommentsApi.ts PR-only cached reads and explicit refresh; no draft writes.
+  agentReviewApi.ts   Authenticated model catalog, whole-diff size/revision checks,
+                      start/stop, finding decisions and private finding follow-ups.
+  agentReviewProtocol.ts Whole-diff prompt and validated, diff-anchored findings.
 shared/
   types.ts            API request/response types + zod schemas.
   review.ts           Anchors, question/proposal intents, private threads,
                       review drafts and publication request types.
+  githubComments.ts   Published PR comments, review summaries and reply threads.
+  agentReview.ts      Model/reasoning choices, runs and pending findings.
 src/
   App.tsx             Diff/navigation frontend. Renders the diff with
                       @pierre/diffs CodeView (virtualized, shadow-DOM items);
                       react-query for API state.
   ReviewPanel.tsx     Private chats/proposals, editable draft comments and
                       explicitly confirmed GitHub publication.
+  GitHubComments.tsx Read-only published discussion, grouped replies, refresh.
+  AgentReview.tsx    Whole-diff review prompt/model picker and finding actions.
+  FindingChat.tsx    Private per-finding follow-ups in the original review conversation.
+  reviewAnnotations.ts Diff anchors for published threads and private findings.
   ReviewMarkdown.tsx Safe Markdown rendering: no raw HTML or remote images.
   FileSidebar.tsx     Collapsible/filterable file tree and navigation.
   HunkPriorities.tsx  Explicit scoring controls, ranked results and inline badges.
   styles.css          Base styles and shared OKLCH color/elevation tokens.
-                      review.css, fileSidebar.css and priorities.css reuse them;
+                      review.css, fileSidebar.css, priorities.css,
+                      githubComments.css and agentReview.css reuse them;
                       extend the ramp, don't add ad hoc colors.
 ```
 
 The normal flow uses `shared/review.ts`, `server/reviewApi.ts`,
 `server/reviewContext.ts` (read-only bounded tools and revision anchors),
 `server/reviewStore.ts` (Pi Durable SQLite), `server/reviewAgent.ts`
-(model/auth), `server/github.ts` (PR checkout/publication), and
+(model/auth, including GitHub Copilot), `server/github.ts` (PR checkout,
+read-only discussion transport, publication), and
 `src/ReviewPanel.tsx`. `server/reviewCodemode.ts` adds the bounded QuickJS worker
 sandbox, and `server/reviewClassifier.ts` loads explicit System One endpoint
 configuration (`--classifier-config`, `SKEPSIS_CLASSIFIER_CONFIG`, then the user's
@@ -85,6 +98,25 @@ parsing, source-writing routes, discovery records, or poll/answer/fail clients.
 Proposal requests use the private thread APIs with intent `propose-change`. They
 must not edit files, save drafts automatically, or publish. Human copy/save/preview
 and submission remain separate steps.
+
+Published GitHub PR discussion (conversation comments, review summaries and grouped
+inline replies) is read-only and separate from private threads/drafts. Keep resolved
+and outdated threads visible; bounded pagination fails closed instead of returning
+partial data. Refresh is explicit, uses `gh` authentication, and never starts a
+model run. Agent Review is an explicit, pinned-revision whole-original-diff run in
+the same durable Pi store. Show only available authenticated chat models and each
+model's supported reasoning levels; allow a custom prompt, with Conventional
+Comments as the default. Reject diffs over 128,000 UTF-8 bytes whole, not by
+truncating or substituting expanded browser hunks; narrow to fewer files. Findings
+stay pending until individually accepted as editable private drafts or dismissed.
+Acceptance never selects or publishes a draft; stale findings cannot be accepted.
+Finding chats explicitly continue the original pinned-model review conversation;
+turns carry findingId for UI scoping. Parse only the original review as findings:
+follow-up Markdown must never replace findings/summary or alter drafts/decisions.
+Allow one outstanding follow-up per run, durable idempotent retries, and cancellation.
+Stale runs and --no-agent retain chat history but reject new messages.
+`--no-agent` pauses Agent Review, not read-only GitHub discussion. Stub GitHub reads
+and model runs in tests; never use real credentials or services.
 
 Classifier `maxConcurrency` (1–64, default 4) and `maxQueuedRequests` (0–256,
 default 64) govern independent codemode calls. The FIFO queue is bounded and

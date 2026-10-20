@@ -12,6 +12,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { ReviewAnchor, ReviewSnapshot, SubmitReview } from '../shared/review.ts'
 import { ReviewMarkdown, safeReviewUrl } from './ReviewMarkdown.tsx'
 import './review.css'
+import { ReviewTool } from './ReviewToolbar.tsx'
 
 type ComposerMode = 'ask' | 'propose-change' | 'draft'
 
@@ -815,16 +816,28 @@ export function ReviewPanel({ review }: { review: ReviewController }) {
     publication?.status === 'publishing' ||
     publication?.status === 'uncertain'
   return (
-    <details className="durable-review-panel">
-      <summary className="review-panel-heading">
-        Review{' '}
-        <span className="review-pill">
-          {drafts.length} draft{drafts.length === 1 ? '' : 's'}
-        </span>{' '}
-        <span className="review-pill">
-          {snapshot.threads.length} private thread{snapshot.threads.length === 1 ? '' : 's'}
-        </span>
-      </summary>
+    <ReviewTool
+      id="review"
+      className="durable-review-panel"
+      summaryClassName="review-panel-heading"
+      compactHeading={
+        <>
+          Review <span className="review-pill">{drafts.length} drafts</span>
+        </>
+      }
+      heading={
+        <>
+          Review{' '}
+          <span className="review-pill">
+            {drafts.length} draft{drafts.length === 1 ? '' : 's'}
+          </span>{' '}
+          <span className="review-pill">
+            {snapshot.threads.length} private thread
+            {snapshot.threads.length === 1 ? '' : 's'}
+          </span>
+        </>
+      }
+    >
       <p className="review-notice">
         <strong>You control what is published.</strong> Only selected saved drafts and
         summary are published. Private chats are excluded.
@@ -1033,6 +1046,6 @@ export function ReviewPanel({ review }: { review: ReviewController }) {
         </>
       )}
       {review.mutation.error && <p role="alert">{review.mutation.error.message}</p>}
-    </details>
+    </ReviewTool>
   )
 }

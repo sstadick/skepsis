@@ -723,7 +723,11 @@ it('App expands and scrolls a selected file without marking viewed or resetting 
   expect(
     container.querySelector<HTMLTextAreaElement>('.durable-line-chat textarea')!.value,
   ).toBe('Unsaved question')
-  await click(button('Show priorities'))
+  await click(
+    container.querySelector<HTMLButtonElement>(
+      '[data-tool="priorities"] .review-tool-trigger',
+    ),
+  )
   await click(
     container.querySelector<HTMLButtonElement>('[data-priority-id="deleted-score"]'),
   )

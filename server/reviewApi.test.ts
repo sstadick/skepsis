@@ -582,6 +582,7 @@ it.each(['question', 'propose-change'] as const)(
     const { mutate, store } = await fixture()
     const threadId = randomUUID()
     vi.spyOn(store, 'snapshot').mockResolvedValue({
+      agentReviews: [],
       drafts: [],
       publication: null,
       threads: [

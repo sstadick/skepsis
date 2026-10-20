@@ -15,10 +15,22 @@ import lockfile from 'proper-lockfile'
 import { createCodemodeExtension } from '@earendil-works/pi-durable/codemode'
 import { ReviewCodemodeSandbox } from './reviewCodemode.ts'
 import { formatReviewInput } from './reviewProposal.ts'
+import {
+  formatAgentReviewInput,
+  formatFindingQuestion,
+  parseAgentReviewAnswer,
+} from './agentReviewProtocol.ts'
+import { findingMessageSchema, startAgentReviewSchema } from '../shared/agentReview.ts'
+import type {
+  AgentReviewRun,
+  FindingMessage,
+  ReviewLocation,
+  StartAgentReview,
+} from '../shared/agentReview.ts'
 import { PublicationRejected } from './github.ts'
 import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context'
 import type { JsonRepresentation } from '@earendil-works/chord'
-import type { Models } from '@earendil-works/pi-ai/models'
+import { getSupportedThinkingLevels, type Models } from '@earendil-works/pi-ai/models'
 import {
   AgentDoc,
   AssistantEntry,
@@ -49,6 +61,7 @@ export class ReviewRequestConflict extends Error {}
 export interface ReviewStore {
   snapshot(): Promise<{
     threads: LineThread[]
+    agentReviews: AgentReviewRun[]
     drafts: ReviewDraft[]
     publication: ReviewPublication | null
   }>
@@ -63,6 +76,13 @@ export interface ReviewStore {
     threadId: string,
     input: { id: string; text: string; context: string; intent?: ReviewIntent },
   ): Promise<void>
+  startAgentReview(
+    input: StartAgentReview & { context: string; locations: ReviewLocation[] },
+  ): Promise<void>
+  askFinding(runId: string, findingId: string, input: FindingMessage): Promise<void>
+  updateRevision(revision: string): Promise<void>
+  acceptFinding(runId: string, findingId: string, revision: string): Promise<void>
+  dismissFinding(runId: string, findingId: string): Promise<void>
   confirmProvider(threadId: string, provider: string): Promise<void>
   abandonPublication(id: string): Promise<void>
   cancel(threadId: string): Promise<void>
@@ -84,14 +104,21 @@ export interface ReviewStore {
 
 type Intent = {
   id: string
+  /** Subject ID: either a line thread or a whole-diff review run. */
   threadId: string
   content: string
+  /** Original served-patch ranges, persisted for validation after restart. */
+  locations?: ReviewLocation[]
+  /** Finding-scoped Markdown follow-up in the original whole-review conversation. */
+  findingId?: string
   requestId: string
   remainingMs: number
   status: 'queued' | 'running' | 'done' | 'cancelled'
 }
 type State = JsonRepresentation<{
   threads: LineThread[]
+  /** Optional for existing v2 journals; never migrate old conversation history. */
+  agentReviews?: AgentReviewRun[]
   conversations: Record<string, number>
   intents: Intent[]
   drafts: ReviewDraft[]
@@ -126,6 +153,9 @@ const ReviewDoc = defineDoc<State>({
   checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 31,
 })
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value))
+const subject = (state: State, id: string): LineThread | AgentReviewRun | undefined =>
+  state.threads.find((item) => item.id === id) ??
+  state.agentReviews?.find((item) => item.id === id)
 const textOf = (content: readonly { type: string; text?: string }[] | undefined) =>
   content
     ?.filter((part) => part.type === 'text')
@@ -137,6 +167,8 @@ export async function openReviewStore(opts: {
   cwd: string
   models: Models
   model?: { provider: string; modelId: string }
+  /** Enables inference without requiring a default line-thread model. */
+  inferenceEnabled?: boolean
   currentRevision?: string
   tools: readonly ToolRegistration[]
   onChange: () => void
@@ -144,6 +176,7 @@ export async function openReviewStore(opts: {
   classifierInstructions?: string
   toolPolicyKey?: string
 }): Promise<ReviewStore> {
+  const inferenceEnabled = opts.inferenceEnabled ?? opts.model !== undefined
   await mkdir(opts.directory, { recursive: true, mode: 0o700 })
   const release = await lockfile.lock(opts.directory, { retries: 0 })
   let harness: Harness
@@ -210,6 +243,7 @@ export async function openReviewStore(opts: {
     void harness.closed.then(() => sandbox.close()).catch(() => {})
     const root = await harness.root(context)
     let closed = false
+    let currentRevision = opts.currentRevision
     // Stop admitting work immediately, but keep accounting/timeout enforcement
     // while publication receipts are being drained into the still-open database.
     let closingHarness = false
@@ -239,9 +273,18 @@ export async function openReviewStore(opts: {
         }
       }, 100)
     }
+    // Snapshot copies share only the short host-commit queue, never transport
+    // cancellation waits. Readers cannot observe half of an acceptance decision.
+    let transactions: Promise<unknown> = Promise.resolve()
+    const transaction = <T>(fn: () => Promise<T>): Promise<T> => {
+      const next = transactions.then(fn)
+      transactions = next.catch(() => {})
+      return next
+    }
+    const commit: typeof root.commit = (fn, ctx) => transaction(() => root.commit(fn, ctx))
     const read = async () => (await harness.snapshot(ReviewDoc, root.id, context))!
     const change = async (fn: (state: State) => void | Promise<void>) => {
-      await root.commit(async (tx) => fn(await tx.doc(ReviewDoc, root.id)), context)
+      await commit(async (tx) => fn(await tx.doc(ReviewDoc, root.id)), context)
       notify()
     }
     await change((state) => {
@@ -293,9 +336,13 @@ export async function openReviewStore(opts: {
     }
     const stop = async (threadId: string, resolved: boolean, error = 'Cancelled') => {
       await change((state) => {
-        const thread = state.threads.find((item) => item.id === threadId)
+        const thread = subject(state, threadId)
         if (!thread) throw new Error('Unknown review thread')
-        if (resolved) thread.resolved = true
+        if (resolved) {
+          if (!state.threads.some((item) => item.id === threadId))
+            throw new Error('Only a line thread can be resolved')
+          thread.resolved = true
+        }
         if (!state.stopPending.includes(threadId)) state.stopPending.push(threadId)
         for (const intent of state.intents) {
           if (
@@ -324,7 +371,11 @@ export async function openReviewStore(opts: {
         state.stopPending = state.stopPending.filter((id) => id !== threadId)
       })
     }
-    const run = async () => {
+    const eligible = (intent: Intent) =>
+      intent.locations !== undefined ||
+      intent.findingId !== undefined ||
+      opts.model !== undefined
+    const runQueued = async () => {
       do {
         wake = false
         while (!closed) {
@@ -332,7 +383,8 @@ export async function openReviewStore(opts: {
             if (closed) return
             const state = await read()
             const intent = state.intents.find(
-              (item) => item.status === 'running' || item.status === 'queued',
+              (item) =>
+                (item.status === 'running' || item.status === 'queued') && eligible(item),
             )
             if (!intent) return
             if (intent.remainingMs <= 0) {
@@ -343,7 +395,7 @@ export async function openReviewStore(opts: {
             await change((draft) => {
               draft.intents.find((item) => item.requestId === intent.requestId)!.status =
                 'running'
-              draft.threads.find((item) => item.id === intent.threadId)!.status = 'running'
+              subject(draft, intent.threadId)!.status = 'running'
             })
             const watch = await handle.watch(context)
             watches.add(watch)
@@ -426,11 +478,19 @@ export async function openReviewStore(opts: {
                 (tx) => tx.entry(AssistantEntry, settled.answer),
                 context,
               )
+              // Whole reviews and finding follow-ups use only the final assistant
+              // response, not earlier tool narration. Line threads retain their
+              // existing extraction behavior.
               answer =
-                entry?.model
-                  ?.filter((message) => message.role === 'assistant')
-                  .map((message) => textOf(message.content))
-                  .join('') ?? ''
+                intent.locations !== undefined || intent.findingId !== undefined
+                  ? textOf(
+                      entry?.model?.findLast((message) => message.role === 'assistant')
+                        ?.content,
+                    )
+                  : (entry?.model
+                      ?.filter((message) => message.role === 'assistant')
+                      .map((message) => textOf(message.content))
+                      .join('') ?? '')
               if (!answer.trim()) error = 'The review agent returned an empty answer'
             } else {
               error =
@@ -446,10 +506,32 @@ export async function openReviewStore(opts: {
                 )!
                 if (current.status !== 'running') return
                 current.status = 'done'
-                const thread = state.threads.find((item) => item.id === intent.threadId)!
+                const thread = subject(state, intent.threadId)!
                 const turn = thread.turns.find((item) => item.id === intent.id)!
                 if (error !== undefined) turn.error = error
-                else turn.answer = answer ?? ''
+                else if (current.findingId !== undefined) {
+                  // A discussion cannot regenerate findings or alter a human draft.
+                  turn.answer = answer ?? ''
+                } else if (state.agentReviews?.some((run) => run.id === thread.id)) {
+                  try {
+                    const run = thread as AgentReviewRun
+                    const parsed = parseAgentReviewAnswer(
+                      answer ?? '',
+                      run.revision,
+                      current.locations ?? [],
+                    )
+                    run.summary = parsed.summary
+                    run.findings = parsed.findings
+                    turn.answer = parsed.summary
+                  } catch (reason) {
+                    // Validation errors are intentionally bounded and contain no model text.
+                    error =
+                      reason instanceof Error
+                        ? reason.message
+                        : 'Invalid agent review output'
+                    turn.error = error
+                  }
+                } else turn.answer = answer ?? ''
                 thread.status = state.intents.some(
                   (item) => item.threadId === thread.id && item.status === 'queued',
                 )
@@ -473,8 +555,8 @@ export async function openReviewStore(opts: {
     }
     const kick = () => {
       wake = true
-      if (worker || closed || !opts.model) return
-      worker = run()
+      if (worker || closed || !inferenceEnabled) return
+      worker = runQueued()
         .catch(async (error: unknown) => {
           if (closingHarness) return
           clearReservationTimers()
@@ -484,12 +566,14 @@ export async function openReviewStore(opts: {
               (item) => item.status === 'running',
             )) {
               intent.status = 'done'
-              const thread = state.threads.find((item) => item.id === intent.threadId)!
+              const thread = subject(state, intent.threadId)!
               thread.status = 'failed'
               thread.turns.find((item) => item.id === intent.id)!.error = String(error)
             }
           }).catch(() => {})
-          wake = (await read()).intents.some((intent) => intent.status === 'queued')
+          wake = (await read()).intents.some(
+            (intent) => intent.status === 'queued' && eligible(intent),
+          )
         })
         .finally(() => {
           worker = undefined
@@ -500,11 +584,10 @@ export async function openReviewStore(opts: {
     // The host admits at most one intent; aborting that intent cannot wake another
     // admitted generation with tools bound to the new revision.
     const recovered = await read()
-    const policyChanged =
-      opts.model !== undefined && recovered.toolPolicyKey !== opts.toolPolicyKey
+    const policyChanged = inferenceEnabled && recovered.toolPolicyKey !== opts.toolPolicyKey
     const changedModels = new Set<string>()
     const changedProviders = new Map<string, { from: string; to: string }>()
-    if (opts.model) {
+    if (inferenceEnabled && opts.model) {
       for (const thread of recovered.threads) {
         const saved = await harness.snapshot(
           AgentDoc,
@@ -533,14 +616,35 @@ export async function openReviewStore(opts: {
       }
       for (const intent of state.intents) {
         if (intent.status !== 'queued' && intent.status !== 'running') continue
-        const thread = state.threads.find((item) => item.id === intent.threadId)!
+        const thread = subject(state, intent.threadId)!
+        const whole = state.agentReviews?.find((item) => item.id === thread.id)
         const stale =
-          opts.model !== undefined &&
+          inferenceEnabled &&
+          (whole !== undefined || opts.model !== undefined) &&
           opts.currentRevision !== undefined &&
-          thread.anchor.revision !== opts.currentRevision
-        const modelChanged = intent.status === 'running' && changedModels.has(thread.id)
-        const providerChanged = changedProviders.has(thread.id)
-        if (!stale && !modelChanged && !providerChanged && !policyChanged) continue
+          (whole?.revision ?? (thread as LineThread).anchor.revision) !==
+            opts.currentRevision
+        const modelChanged =
+          !whole && intent.status === 'running' && changedModels.has(thread.id)
+        const providerChanged = !whole && changedProviders.has(thread.id)
+        const pinnedModel =
+          whole && inferenceEnabled
+            ? opts.models.getModel(whole.model.provider, whole.model.modelId)
+            : undefined
+        const missingModel = whole && inferenceEnabled && !pinnedModel
+        const unsupportedReasoning =
+          whole &&
+          pinnedModel &&
+          !getSupportedThinkingLevels(pinnedModel).includes(whole.reasoningLevel)
+        if (
+          !stale &&
+          !modelChanged &&
+          !providerChanged &&
+          !policyChanged &&
+          !missingModel &&
+          !unsupportedReasoning
+        )
+          continue
         if (intent.status === 'running' && !state.stopPending.includes(thread.id))
           state.stopPending.push(thread.id)
         intent.status = 'cancelled'
@@ -550,12 +654,16 @@ export async function openReviewStore(opts: {
           : providerChanged
             ? 'Provider changed; confirm before sending conversation history'
             : stale
-              ? 'Review revision changed; start a new thread'
-              : 'Model changed; send a follow-up'
+              ? whole
+                ? 'Review revision changed; start a new review'
+                : 'Review revision changed; start a new thread'
+              : missingModel || unsupportedReasoning
+                ? 'Selected review model or reasoning level is unavailable; start a new review'
+                : 'Model changed; send a follow-up'
       }
     })
-    // Persist policy only with an active model; --no-agent must preserve paused work.
-    if (opts.model)
+    // Persist policy only when inference is enabled; --no-agent preserves paused work.
+    if (inferenceEnabled)
       await change((state) => {
         if (opts.toolPolicyKey === undefined) delete state.toolPolicyKey
         else state.toolPolicyKey = opts.toolPolicyKey
@@ -567,14 +675,25 @@ export async function openReviewStore(opts: {
         state.stopPending = state.stopPending.filter((item) => item !== id)
       })
     }
-    if (opts.model) {
+    if (inferenceEnabled) {
       const state = await read()
       for (const [threadId, id] of Object.entries(state.conversations)) {
         if (state.threads.find((thread) => thread.id === threadId)?.providerChange) continue
-        await root.commit(
+        const run = state.agentReviews?.find((item) => item.id === threadId)
+        // Whole-review history stays pinned; a different default must never
+        // rebind it to a different provider on restart.
+        if (run) {
+          const pinned = opts.models.getModel(run.model.provider, run.model.modelId)
+          if (!pinned || !getSupportedThinkingLevels(pinned).includes(run.reasoningLevel))
+            continue
+        }
+        const model = run?.model ?? opts.model
+        if (!model) continue // Line threads require a configured default.
+        await commit(
           (tx) =>
             configure(tx, id as ConversationId, {
-              model: opts.model,
+              model,
+              ...(run ? { thinkingLevel: run.reasoningLevel } : {}),
               cwd: opts.cwd,
               tools,
             }),
@@ -588,7 +707,7 @@ export async function openReviewStore(opts: {
       anchor?: ReviewAnchor,
     ) => {
       await admit(async () => {
-        await root.commit(async (tx) => {
+        await commit(async (tx) => {
           const state = await tx.doc(ReviewDoc, root.id)
           const intent = input.intent ?? 'question'
           const existing = state.intents.find((item) => item.id === input.id)
@@ -613,7 +732,12 @@ export async function openReviewStore(opts: {
               )
             return
           }
-          if (!opts.model) throw new Error('Configure a review model before asking Pi')
+          if (!inferenceEnabled || !opts.model)
+            throw new Error('Configure a review model before asking Pi')
+          if (state.agentReviews?.some((run) => run.id === threadId || run.id === input.id))
+            throw new ReviewRequestConflict(
+              'Turn or thread ID is already used by a review run',
+            )
           let thread = state.threads.find((item) => item.id === threadId)
           if (anchor) {
             if (thread) throw new ReviewRequestConflict('Thread ID is already used')
@@ -654,6 +778,194 @@ export async function openReviewStore(opts: {
       })
       kick()
     }
+    const startAgentReview: ReviewStore['startAgentReview'] = async (input) => {
+      const request = startAgentReviewSchema.parse({
+        id: input.id,
+        revision: input.revision,
+        prompt: input.prompt,
+        model: input.model,
+        reasoningLevel: input.reasoningLevel,
+      })
+      if (
+        input.locations.length > 100_000 ||
+        input.locations.some(
+          (location) =>
+            !location.path ||
+            location.path.length > 4096 ||
+            !['LEFT', 'RIGHT'].includes(location.side) ||
+            !Number.isSafeInteger(location.start) ||
+            location.start <= 0 ||
+            !Number.isSafeInteger(location.count) ||
+            location.count <= 0,
+        )
+      )
+        throw new Error('Invalid review locations')
+      await admit(async () => {
+        // Credential discovery may block or refresh auth; never await it inside a
+        // durable commit. Retries of an existing ID retain their idempotency.
+        const alreadySaved = (await read()).agentReviews?.some(
+          (run) => run.id === request.id,
+        )
+        if (!alreadySaved && !inferenceEnabled)
+          throw new Error('Configure a review model before asking Pi')
+        if (currentRevision !== undefined && request.revision !== currentRevision)
+          throw new Error('Review revision changed; start a new review')
+        if (!alreadySaved) {
+          const model = opts.models.getModel(request.model.provider, request.model.modelId)
+          if (!model || !getSupportedThinkingLevels(model).includes(request.reasoningLevel))
+            throw new Error('Selected review model or reasoning level is unavailable')
+          const available = await opts.models.getAvailable(request.model.provider)
+          if (!available.some((item) => item.id === request.model.modelId))
+            throw new Error(
+              'Selected review model is unavailable; configure authentication',
+            )
+        }
+        await commit(async (tx) => {
+          const state = await tx.doc(ReviewDoc, root.id)
+          const existing = state.agentReviews?.find((run) => run.id === request.id)
+          if (existing) {
+            const locations = state.intents.find(
+              (intent) => intent.threadId === request.id,
+            )?.locations
+            if (
+              existing.revision !== request.revision ||
+              existing.turns[0]?.question !== request.prompt ||
+              existing.model.provider !== request.model.provider ||
+              existing.model.modelId !== request.model.modelId ||
+              existing.reasoningLevel !== request.reasoningLevel ||
+              JSON.stringify(locations) !== JSON.stringify(input.locations)
+            )
+              throw new ReviewRequestConflict(
+                'Review ID is already used for another request',
+              )
+            return
+          }
+          if (
+            state.threads.some((thread) => thread.id === request.id) ||
+            state.intents.some((intent) => intent.id === request.id)
+          )
+            throw new ReviewRequestConflict('Review ID is already used')
+          const created = await tx.createConversation({ ownership: { kind: 'ownerless' } })
+          await configure(tx, created.id, {
+            model: request.model,
+            thinkingLevel: request.reasoningLevel,
+            cwd: opts.cwd,
+            tools,
+          })
+          state.conversations[request.id] = created.id
+          state.agentReviews ??= []
+          state.agentReviews.push({
+            id: request.id,
+            revision: request.revision,
+            model: request.model,
+            reasoningLevel: request.reasoningLevel,
+            findings: [],
+            turns: [{ id: request.id, question: request.prompt }],
+            status: 'queued',
+            resolved: false,
+          })
+          state.intents.push({
+            id: request.id,
+            threadId: request.id,
+            content: formatAgentReviewInput({ ...request, context: input.context }),
+            locations: copy(input.locations),
+            requestId: `agent-review:${request.id}`,
+            remainingMs: opts.maxRunMs ?? 300_000,
+            status: 'queued',
+          })
+        }, context)
+        notify()
+      })
+      kick()
+    }
+    const askFinding: ReviewStore['askFinding'] = async (runId, findingId, input) => {
+      const request = findingMessageSchema.parse(input)
+      const admitted = await admit(async () => {
+        // Check the durable ID first: an exact retry succeeds even after a decision,
+        // revision change, model outage, or --no-agent. Never schedule it twice.
+        const check = (state: State) => {
+          const existing = state.intents.find((item) => item.id === request.id)
+          if (existing) {
+            const turn = state.agentReviews
+              ?.find((run) => run.id === existing.threadId)
+              ?.turns.find((item) => item.id === request.id)
+            if (
+              existing.threadId !== runId ||
+              existing.findingId !== findingId ||
+              turn?.findingId !== findingId ||
+              turn.question !== request.text
+            )
+              throw new ReviewRequestConflict(
+                'Turn ID is already used for a different request',
+              )
+            return { retry: true } as const
+          }
+          if (
+            state.threads.some((thread) => thread.id === request.id) ||
+            state.agentReviews?.some(
+              (run) =>
+                run.id === request.id ||
+                run.findings.some((item) => item.id === request.id),
+            ) ||
+            state.drafts.some((draft) => draft.id === request.id) ||
+            state.publications.some((publication) => publication.id === request.id)
+          )
+            throw new ReviewRequestConflict('Turn ID is already used')
+          const run = state.agentReviews?.find((item) => item.id === runId)
+          if (!run) throw new Error('Unknown agent review')
+          const finding = run.findings.find((item) => item.id === findingId)
+          if (!finding) throw new Error('Unknown agent review finding')
+          if (
+            state.intents.some(
+              (item) =>
+                item.threadId === runId &&
+                (item.status === 'queued' || item.status === 'running'),
+            )
+          )
+            throw new ReviewRequestConflict('A review request is already in progress')
+          return { retry: false, run, finding } as const
+        }
+        const checked = check(await read())
+        if (checked.retry) return false
+        if (!inferenceEnabled) throw new Error('Configure a review model before asking Pi')
+        if (currentRevision !== undefined && checked.run.revision !== currentRevision)
+          throw new Error('Review revision changed; start a new review')
+        // Credential discovery may refresh auth; keep it outside the durable
+        // transaction, but inside single-admission serialization.
+        const model = opts.models.getModel(
+          checked.run.model.provider,
+          checked.run.model.modelId,
+        )
+        if (
+          !model ||
+          !getSupportedThinkingLevels(model).includes(checked.run.reasoningLevel)
+        )
+          throw new Error('Selected review model or reasoning level is unavailable')
+        const available = await opts.models.getAvailable(checked.run.model.provider)
+        if (!available.some((item) => item.id === checked.run.model.modelId))
+          throw new Error('Selected review model is unavailable; configure authentication')
+        await commit(async (tx) => {
+          const state = await tx.doc(ReviewDoc, root.id)
+          const current = check(state)
+          if (current.retry) return
+          const { run, finding } = current
+          run.turns.push({ id: request.id, question: request.text, findingId })
+          run.status = 'queued'
+          state.intents.push({
+            id: request.id,
+            threadId: runId,
+            findingId,
+            content: formatFindingQuestion(finding, request.text),
+            requestId: `finding:${runId}:${request.id}`,
+            remainingMs: opts.maxRunMs ?? 300_000,
+            status: 'queued',
+          })
+        }, context)
+        notify()
+        return true
+      })
+      if (admitted) kick()
+    }
     // Kept beside the journal operations to make its freeze policy explicit.
     // oxlint-disable-next-line unicorn/consistent-function-scoping
     const frozen = (state: State, id: string) =>
@@ -680,24 +992,85 @@ export async function openReviewStore(opts: {
         if (publication.draftIds.includes(draft.id)) draft.publishedReviewId = result.id
     }
     const store: ReviewStore = {
-      async snapshot() {
-        const state = await read()
-        return {
-          threads: state.threads.map((thread) => ({
-            ...copy(thread),
-            ...(thread.status === 'running' && partials.get(thread.id)
-              ? { partial: partials.get(thread.id) }
-              : {}),
-          })),
-          drafts: copy(state.drafts),
-          publication: copy(state.publications.at(-1) ?? null),
-        }
-      },
+      snapshot: () =>
+        transaction(async () => {
+          const state = await read()
+          return {
+            threads: state.threads.map((thread) => ({
+              ...copy(thread),
+              ...(thread.status === 'running' && partials.get(thread.id)
+                ? { partial: partials.get(thread.id) }
+                : {}),
+            })),
+            agentReviews: (state.agentReviews ?? []).map((run) => {
+              const review = copy(run)
+              if (review.status === 'running' && partials.get(review.id))
+                review.partial = partials.get(review.id)
+              return review
+            }),
+            drafts: copy(state.drafts),
+            publication: copy(state.publications.at(-1) ?? null),
+          }
+        }),
       ask: (input) => enqueue(input.id, input, input.anchor),
       reply: (id, input) => enqueue(id, input),
+      startAgentReview,
+      askFinding,
+      updateRevision: (revision) =>
+        admit(async () => {
+          currentRevision = revision
+          const state = await read()
+          for (const run of state.agentReviews ?? []) {
+            if (
+              run.revision !== revision &&
+              state.intents.some(
+                (intent) =>
+                  intent.threadId === run.id &&
+                  (intent.status === 'queued' || intent.status === 'running'),
+              )
+            )
+              await stop(run.id, false, 'Review revision changed; start a new review')
+          }
+        }),
+      acceptFinding: (runId, findingId, revision) =>
+        admit(() =>
+          change((state) => {
+            const run = state.agentReviews?.find((item) => item.id === runId)
+            if (!run) throw new Error('Unknown agent review')
+            if (
+              run.revision !== revision ||
+              (currentRevision !== undefined && run.revision !== currentRevision)
+            )
+              throw new Error('Review revision changed; refresh before accepting findings')
+            const finding = run.findings.find((item) => item.id === findingId)
+            if (!finding) throw new Error('Unknown agent review finding')
+            if (finding.status === 'accepted') return
+            if (finding.status !== 'pending') throw new Error('Finding was dismissed')
+            if (state.drafts.some((draft) => draft.id === finding.id))
+              throw new ReviewRequestConflict('Finding ID already belongs to a draft')
+            state.drafts.push({
+              id: finding.id,
+              anchor: copy(finding.anchor),
+              body: finding.body,
+            })
+            finding.status = 'accepted'
+          }),
+        ),
+      dismissFinding: (runId, findingId) =>
+        admit(() =>
+          change((state) => {
+            const finding = state.agentReviews
+              ?.find((run) => run.id === runId)
+              ?.findings.find((item) => item.id === findingId)
+            if (!finding) throw new Error('Unknown agent review finding')
+            if (finding.status === 'dismissed') return
+            if (finding.status !== 'pending') throw new Error('Finding was accepted')
+            finding.status = 'dismissed'
+          }),
+        ),
       confirmProvider: (id, provider) =>
         admit(async () => {
-          await root.commit(async (tx) => {
+          await commit(async (tx) => {
             const state = await tx.doc(ReviewDoc, root.id)
             const thread = state.threads.find((item) => item.id === id)
             if (

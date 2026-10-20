@@ -1,0 +1,166 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, you can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * Copyright Oxide Computer Company
+ */
+
+/* One quiet control row; open panels overlay the diff instead of shrinking it. */
+.review-tools {
+  position: relative;
+  z-index: 5;
+  flex-shrink: 0;
+  min-width: 0;
+  margin: 0 12px;
+  font:
+    12px/1.4 system-ui,
+    sans-serif;
+  color: var(--fg);
+}
+.review-tools-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--bg-panel);
+}
+.review-tool {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.review-tool + .review-tool {
+  border-left: 1px solid var(--border-soft);
+  padding-left: 4px;
+}
+.review-tools-actions button,
+.review-tools-close {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.review-tools-actions button:hover:not(:disabled),
+.review-tools-actions button[aria-expanded='true'],
+.review-tools-close:hover {
+  color: var(--fg-bright);
+  background: var(--bg-control-hover);
+  border-color: var(--border-soft);
+}
+.review-tools-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.review-tools :is(button, summary):focus-visible {
+  outline: 2px solid var(--blue-text);
+  outline-offset: 2px;
+}
+.review-tool-chevron,
+.review-tool-state {
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.review-tool-state {
+  white-space: nowrap;
+}
+.review-tool-state[data-tone='warning'] {
+  color: var(--amber);
+}
+.review-tool-state[data-tone='error'] {
+  color: var(--red);
+}
+.review-tools-actions :is(.review-pill, .github-comments-count, .agent-review-pill) {
+  margin: 0;
+  padding: 1px 5px;
+  font-size: 10px;
+}
+.review-tools-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  width: min(760px, 100%);
+  max-height: min(70vh, 680px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+}
+.review-tools-close {
+  position: sticky;
+  z-index: 1;
+  top: 4px;
+  display: flex;
+  margin: 4px 4px 0 auto;
+  background: var(--bg-control);
+  border-color: var(--border-soft);
+}
+/* Keep one scroll surface and the original panel's scoped control styles. */
+.review-tools-popover .review-tool-content {
+  max-height: none;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  padding: 4px 16px 16px;
+  scrollbar-gutter: auto;
+}
+.review-tools-popover[hidden],
+.review-tool-content[hidden] {
+  display: none;
+}
+.review-tools-popover .github-comments-content {
+  margin-top: 0;
+}
+.review-tools-popover .review-notice {
+  margin-top: 0;
+}
+.review-workspace .diff-container {
+  gap: 8px;
+}
+
+.agent-review-settings {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(100px, 150px);
+  gap: 12px;
+}
+.agent-review-settings label {
+  min-width: 0;
+}
+.agent-review-settings select {
+  text-overflow: ellipsis;
+}
+.review-tool-content.agent-review-panel textarea {
+  min-height: 80px;
+}
+
+@media (max-width: 600px) {
+  .review-tools {
+    margin: 0 8px;
+  }
+  .review-tools-actions {
+    gap: 2px;
+  }
+  .review-tools-actions button {
+    padding-inline: 6px;
+  }
+  .review-tool + .review-tool {
+    padding-left: 2px;
+  }
+  .agent-review-settings {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+}

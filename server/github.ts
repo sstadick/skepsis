@@ -10,6 +10,7 @@ import { execFile } from 'node:child_process'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { join, resolve as resolvePath } from 'node:path'
 import lockfile from 'proper-lockfile'
+import { createGitHubCommentsClient } from './githubComments.ts'
 import {
   draftSchema,
   submitReviewSchema,
@@ -455,3 +456,5 @@ export const {
   publishReview,
   findPublishedReview,
 } = createGitHubClient()
+
+export const { getPullRequestComments } = createGitHubCommentsClient(run)

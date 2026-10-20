@@ -7,6 +7,7 @@
  */
 
 import { z } from 'zod'
+import type { AgentReviewRun } from './agentReview.ts'
 
 export const anchorSchema = z.object({
   path: z.string().min(1).max(4096),
@@ -129,11 +130,14 @@ export interface ReviewSnapshot {
   agent: {
     model: string | null
     available: boolean
+    /** Explicit policy switch; independent of the default model's credentials. */
+    enabled?: boolean
     error?: string
     codemode?: boolean
     classifier?: { provider: string; model: string; endpoint: string }
   }
   threads: LineThread[]
+  agentReviews?: AgentReviewRun[]
   drafts: ReviewDraft[]
   publication: ReviewPublication | null
 }

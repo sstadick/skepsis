@@ -160,11 +160,15 @@ export async function getFileContents(
   if (!src.endpoints) return { oldContents: null, newContents: null }
   const signal = AbortSignal.timeout(15000)
   const { left, right } = src.endpoints
-  const [oldContents, newContents] = await Promise.all([
+  // Drain both subprocess trees on failure; an early rejection must not leave
+  // the other endpoint running against a repository the caller may now release.
+  const [oldResult, newResult] = await Promise.allSettled([
     fetchRevision(src.vcs, left, oldPath ?? path, cwd, signal),
     right === 'workingCopy'
       ? fetchWorking(cwd, path, signal)
       : fetchRevision(src.vcs, right.rev, path, cwd, signal),
   ])
-  return { oldContents, newContents }
+  if (oldResult.status === 'rejected') throw oldResult.reason
+  if (newResult.status === 'rejected') throw newResult.reason
+  return { oldContents: oldResult.value, newContents: newResult.value }
 }
